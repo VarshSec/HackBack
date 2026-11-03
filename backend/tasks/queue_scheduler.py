@@ -103,6 +103,11 @@ def promote_queued_scans() -> int:
     dispatched = 0
     for scan_id, domain, mode in promoted:
         try:
+            try:
+                from tasks.auth_store import touch_scan_auth
+                touch_scan_auth(scan_id)
+            except Exception:
+                pass
             scan_orchestrator.delay(scan_id, domain, mode)
             dispatched += 1
             logger.info("promote_queued_scans: started queued scan %s (%s)", scan_id, domain)
@@ -121,3 +126,8 @@ def _mark_failed(db, scan_id: str) -> None:
             db.commit()
     except Exception:
         db.rollback()
+    try:
+        from tasks.auth_store import delete_scan_auth
+        delete_scan_auth(scan_id)
+    except Exception:
+        pass

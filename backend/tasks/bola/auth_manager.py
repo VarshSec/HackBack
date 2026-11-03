@@ -18,8 +18,30 @@ Core Guarantees:
    indiscriminately.
 4. Independent Failure Semantics: Failure to authenticate Identity B never invalidates
    Identity A, but explicitly marks two-identity BOLA verification as inconclusive.
-5. Secret Redaction: Passwords, bearer tokens, cookies, and authorization headers are
-   never logged or exposed in serialized string representations.
+5. Secret Redaction & Comprehensive Cleanup: Passwords, bearer tokens, cookies, and
+   authorization headers are never logged or exposed in serialized string representations.
+   Calling close() or exiting context manager strictly wipes all sessions, cookies,
+   headers, passwords, and bearer tokens from memory while preserving non-sensitive
+   diagnostic telemetry for audit reporting.
+
+Authentication Validation Architecture (Three-Tier Model):
+The BOLA verification engine strictly distinguishes between:
+1. Token Returned (Syntactic Credential Extraction):
+   The login endpoint returned an HTTP response with a body containing a token string.
+   *Caveat*: Extraction proves only that the login endpoint responded with a token.
+   It does NOT prove that the token is valid, active, unexpired, authorized for the API,
+   or accepted by resource endpoints.
+2. Authentication Response Accepted (Transport Handshake):
+   The target server accepted credentials with HTTP 200/302, set session cookies, or satisfied
+   logged_in_indicator / login form absence heuristics.
+   *Caveat*: Proves the login gateway accepted the credentials, but does NOT verify
+   which user identity the active session represents (e.g. server may collapse unknown users
+   to a guest session or default tenant).
+3. Identity Actually Verified (Resource Profile Confirmation):
+   An authenticated profile endpoint (e.g., /api/user/me, /api/profile) is queried using the
+   session and confirmed to return identity attributes matching the configured user.
+   *Guarantee*: Full identity confirmation is performed during candidate resource extraction
+   (P2.3) and matrix verification (P2.4), preventing false-positive BOLA findings.
 """
 
 from __future__ import annotations
@@ -156,9 +178,14 @@ class SessionIdentityManager:
         max_refreshes: int = 1,
     ):
         self._auth_configs: Dict[str, Optional[dict]] = {
-            IDENTITY_PRIMARY: primary_auth,
-            IDENTITY_SECONDARY: secondary_auth,
+            IDENTITY_PRIMARY: dict(primary_auth) if primary_auth else None,
+            IDENTITY_SECONDARY: dict(secondary_auth) if secondary_auth else None,
             IDENTITY_ANONYMOUS: None,
+        }
+        self._configured_flags: Dict[str, bool] = {
+            IDENTITY_PRIMARY: bool(primary_auth),
+            IDENTITY_SECONDARY: bool(secondary_auth),
+            IDENTITY_ANONYMOUS: True,
         }
         self._sessions: Dict[str, Optional[requests.Session]] = {
             IDENTITY_PRIMARY: None,
@@ -183,6 +210,18 @@ class SessionIdentityManager:
         }
         self._max_refreshes = max_refreshes
         self._lock = threading.Lock()
+        self._closed = False
+
+    @property
+    def is_closed(self) -> bool:
+        """Return True if this manager has been closed and sanitized."""
+        with self._lock:
+            return self._closed
+
+    def _check_not_closed(self) -> None:
+        """Enforces that operational actions cannot be executed on a closed manager."""
+        if self._closed:
+            raise RuntimeError("SessionIdentityManager has been closed and cannot be reused")
 
     @classmethod
     def from_scan_id(cls, scan_id: str, max_refreshes: int = 1) -> SessionIdentityManager:
@@ -192,10 +231,10 @@ class SessionIdentityManager:
         return cls(primary_auth, secondary_auth, max_refreshes=max_refreshes)
 
     def is_identity_configured(self, identity: str) -> bool:
-        """Check if an identity has credentials configured."""
+        """Check if an identity was configured for this session manager."""
         if identity == IDENTITY_ANONYMOUS:
             return True
-        return bool(self._auth_configs.get(identity))
+        return bool(self._configured_flags.get(identity, False))
 
     def has_two_identities(self) -> bool:
         """Check if both primary (User A) and secondary (User B) credentials are configured."""
@@ -250,6 +289,7 @@ class SessionIdentityManager:
         Execute authentication for the specified identity in strict isolation.
         Returns True if authentication succeeded (confirmed or probable), False otherwise.
         """
+        self._check_not_closed()
         if identity == IDENTITY_ANONYMOUS:
             with self._lock:
                 if self._sessions[IDENTITY_ANONYMOUS] is None:
@@ -320,7 +360,8 @@ class SessionIdentityManager:
                     session.headers[header] = value
                     return (
                         AuthOutcome.CONFIRMED,
-                        "JSON login returned a valid bearer authentication token.",
+                        "JSON login returned an auth token; response accepted. "
+                        "(Note: token receipt indicates accepted credentials, not verified identity profile)",
                         header,
                         value,
                     )
@@ -412,6 +453,7 @@ class SessionIdentityManager:
 
     def authenticate_all(self) -> Dict[str, bool]:
         """Attempt authentication for all configured identities."""
+        self._check_not_closed()
         results = {}
         for ident in (IDENTITY_PRIMARY, IDENTITY_SECONDARY, IDENTITY_ANONYMOUS):
             if self.is_identity_configured(ident):
@@ -426,6 +468,7 @@ class SessionIdentityManager:
         If auto_authenticate is True and the session has not attempted login,
         it initiates login automatically.
         """
+        self._check_not_closed()
         if identity not in (IDENTITY_PRIMARY, IDENTITY_SECONDARY, IDENTITY_ANONYMOUS):
             raise ValueError(f"Unknown identity: {identity}")
 
@@ -457,6 +500,7 @@ class SessionIdentityManager:
         Returns True if the session was successfully refreshed (caller may retry request),
         False if unrefreshable or budget exceeded.
         """
+        self._check_not_closed()
         if identity == IDENTITY_ANONYMOUS:
             return False
 
@@ -496,26 +540,61 @@ class SessionIdentityManager:
         return self.authenticate(identity)
 
     def close(self) -> None:
-        """Safely close all identity sessions and clear sensitive state."""
+        """
+        Safely close all identity sessions and clear sensitive state from memory.
+        Idempotent: safe to call multiple times without error.
+        Preserves non-sensitive diagnostic telemetry (outcomes, timestamps, refresh counts)
+        for scan reporting while erasing all plaintext secrets, tokens, headers, and cookies.
+        """
         with self._lock:
-            for ident, sess in self._sessions.items():
-                if sess:
+            if self._closed:
+                return
+            self._closed = True
+
+            # 1. Close every existing requests.Session and clear cookies/headers
+            for ident, sess in list(self._sessions.items()):
+                if sess is not None:
                     try:
                         sess.cookies.clear()
+                    except Exception:
+                        pass
+                    try:
                         sess.headers.clear()
+                    except Exception:
+                        pass
+                    try:
                         sess.close()
                     except Exception:
                         pass
                     self._sessions[ident] = None
 
+            # 2. Clear primary and secondary credential dictionaries from memory
+            for ident in list(self._auth_configs.keys()):
+                auth = self._auth_configs[ident]
+                if isinstance(auth, dict):
+                    for k in list(auth.keys()):
+                        auth[k] = None
+                    auth.clear()
+                self._auth_configs[ident] = None
+
+            # 3. Clear sensitive tokens and authorization header strings from state tracking
+            for ident, st in self._states.items():
+                st._token_val = None
+                st.token_header = None
+                # Non-sensitive diagnostics (outcome, detail, last_login_time, refresh_count,
+                # configured, attempted) are preserved for reporting.
+
     def __enter__(self) -> SessionIdentityManager:
+        self._check_not_closed()
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         self.close()
 
     def __repr__(self) -> str:
-        return (
-            f"SessionIdentityManager(primary_configured={self.is_identity_configured(IDENTITY_PRIMARY)}, "
-            f"secondary_configured={self.is_identity_configured(IDENTITY_SECONDARY)})"
-        )
+        with self._lock:
+            closed_str = " (closed)" if self._closed else ""
+            return (
+                f"SessionIdentityManager(primary_configured={self.is_identity_configured(IDENTITY_PRIMARY)}, "
+                f"secondary_configured={self.is_identity_configured(IDENTITY_SECONDARY)}{closed_str})"
+            )

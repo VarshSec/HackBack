@@ -5,6 +5,7 @@ controlled session refresh, and credential redaction.
 """
 
 import json
+from datetime import datetime, timedelta
 from unittest.mock import patch, MagicMock
 import pytest
 import requests
@@ -22,6 +23,9 @@ from tasks.auth_store import (
     get_scan_auth,
     get_scan_auth_both,
     delete_scan_auth,
+    touch_scan_auth,
+    get_scan_auth_ttl,
+    DEFAULT_AUTH_TTL_SECONDS,
 )
 from schemas import ScanRequest, AuthConfig
 
@@ -226,6 +230,152 @@ class TestSessionIsolationAndState:
             assert "secret_password_a" not in state_repr
 
 
+class TestCompleteCredentialCleanup:
+    """Verifies that SessionIdentityManager.close() securely erases all sensitive state."""
+
+    @pytest.fixture
+    def primary_auth(self):
+        return {
+            "login_url": "https://target.test/api/login",
+            "username": "user_a",
+            "password": "secret_password_a",
+            "login_type": "json",
+            "token_json_path": "token",
+        }
+
+    @pytest.fixture
+    def secondary_auth(self):
+        return {
+            "login_url": "https://target.test/api/login",
+            "username": "user_b",
+            "password": "secret_password_b",
+            "login_type": "json",
+            "token_json_path": "token",
+        }
+
+    def test_primary_and_secondary_credentials_cleared_after_close(self, primary_auth, secondary_auth):
+        """1 & 2. Primary and secondary credentials dictionaries are completely wiped after close()."""
+        mgr = SessionIdentityManager(primary_auth, secondary_auth)
+        assert mgr._auth_configs[IDENTITY_PRIMARY] is not None
+        assert mgr._auth_configs[IDENTITY_SECONDARY] is not None
+
+        mgr.close()
+
+        # Both credential dictionaries must be cleared from memory
+        assert mgr._auth_configs[IDENTITY_PRIMARY] is None
+        assert mgr._auth_configs[IDENTITY_SECONDARY] is None
+        assert mgr.is_closed is True
+
+    def test_retained_bearer_tokens_cleared_after_close(self, primary_auth, secondary_auth):
+        """3. Retained bearer tokens and authorization header values are cleared from state tracking."""
+        with patch("tasks.bola.auth_manager.fetch_json_auth_token", side_effect=lambda a: f"token_for_{a['username']}"):
+            mgr = SessionIdentityManager(primary_auth, secondary_auth)
+            mgr.authenticate(IDENTITY_PRIMARY)
+            mgr.authenticate(IDENTITY_SECONDARY)
+
+            # Before close, tokens are present internally
+            assert mgr._states[IDENTITY_PRIMARY]._token_val == "Bearer token_for_user_a"
+            assert mgr._states[IDENTITY_SECONDARY]._token_val == "Bearer token_for_user_b"
+
+            mgr.close()
+
+            # After close, tokens must be None
+            assert mgr._states[IDENTITY_PRIMARY]._token_val is None
+            assert mgr._states[IDENTITY_SECONDARY]._token_val is None
+            assert mgr._states[IDENTITY_PRIMARY].token_header is None
+            assert mgr._states[IDENTITY_SECONDARY].token_header is None
+
+    def test_session_cookies_and_headers_cleared(self, primary_auth, secondary_auth):
+        """4. Active session instances have cookies and headers cleared, and are dereferenced."""
+        with patch("tasks.bola.auth_manager.fetch_json_auth_token", return_value="jwt_test"):
+            mgr = SessionIdentityManager(primary_auth, secondary_auth)
+            sess_a = mgr.get_session(IDENTITY_PRIMARY)
+            sess_b = mgr.get_session(IDENTITY_SECONDARY)
+
+            sess_a.cookies.set("auth_cookie_a", "val_a", domain="target.test")
+            sess_b.cookies.set("auth_cookie_b", "val_b", domain="target.test")
+
+            mgr.close()
+
+            # Session objects in manager are set to None
+            assert mgr._sessions[IDENTITY_PRIMARY] is None
+            assert mgr._sessions[IDENTITY_SECONDARY] is None
+            assert mgr._sessions[IDENTITY_ANONYMOUS] is None
+
+            # Underlying session cookie jars and headers were purged
+            assert len(sess_a.cookies) == 0
+            assert len(sess_b.cookies) == 0
+            assert "Authorization" not in sess_a.headers
+            assert "Authorization" not in sess_b.headers
+
+    def test_calling_close_twice_is_safe_and_idempotent(self, primary_auth, secondary_auth):
+        """5. Calling close() twice does not raise an exception."""
+        mgr = SessionIdentityManager(primary_auth, secondary_auth)
+        mgr.close()
+        # Second call must be a safe no-op
+        mgr.close()
+        assert mgr.is_closed is True
+
+    def test_context_manager_exit_performs_complete_cleanup(self, primary_auth, secondary_auth):
+        """6. Context-manager exit triggers full cleanup of credentials, tokens, and sessions."""
+        with patch("tasks.bola.auth_manager.fetch_json_auth_token", return_value="token_ctx"):
+            with SessionIdentityManager(primary_auth, secondary_auth) as mgr:
+                mgr.authenticate(IDENTITY_PRIMARY)
+                sess = mgr.get_session(IDENTITY_PRIMARY)
+                sess.cookies.set("c", "1", domain="target.test")
+                assert mgr.is_closed is False
+                assert mgr._auth_configs[IDENTITY_PRIMARY] is not None
+                assert mgr._states[IDENTITY_PRIMARY]._token_val is not None
+
+            # Upon exiting with-block, full cleanup has occurred
+            assert mgr.is_closed is True
+            assert mgr._auth_configs[IDENTITY_PRIMARY] is None
+            assert mgr._auth_configs[IDENTITY_SECONDARY] is None
+            assert mgr._states[IDENTITY_PRIMARY]._token_val is None
+            assert mgr._sessions[IDENTITY_PRIMARY] is None
+            assert len(sess.cookies) == 0
+
+    def test_no_credentials_appear_in_diagnostic_output_after_cleanup(self, primary_auth, secondary_auth):
+        """7. Diagnostic state inspection after close() exposes no passwords, tokens, or credentials."""
+        with patch("tasks.bola.auth_manager.fetch_json_auth_token", return_value="leak_test_secret_token"):
+            mgr = SessionIdentityManager(primary_auth, secondary_auth)
+            mgr.authenticate(IDENTITY_PRIMARY)
+            mgr.close()
+
+            # Diagnostics must still report outcomes for audit logs
+            st_a = mgr.get_state(IDENTITY_PRIMARY)
+            assert st_a.outcome == AuthOutcome.CONFIRMED
+            assert st_a.attempted is True
+
+            # But contain no secrets
+            state_str = str(st_a)
+            repr_str = repr(st_a)
+            mgr_repr = repr(mgr)
+
+            for secret in ("secret_password_a", "secret_password_b", "leak_test_secret_token"):
+                assert secret not in state_str
+                assert secret not in repr_str
+                assert secret not in mgr_repr
+                assert secret not in (st_a.detail or "")
+
+    def test_manager_unusable_for_operations_after_close(self, primary_auth, secondary_auth):
+        """8. Operational methods raise RuntimeError after manager is closed."""
+        mgr = SessionIdentityManager(primary_auth, secondary_auth)
+        mgr.close()
+
+        with pytest.raises(RuntimeError, match="SessionIdentityManager has been closed"):
+            mgr.get_session(IDENTITY_PRIMARY)
+
+        with pytest.raises(RuntimeError, match="SessionIdentityManager has been closed"):
+            mgr.authenticate(IDENTITY_PRIMARY)
+
+        with pytest.raises(RuntimeError, match="SessionIdentityManager has been closed"):
+            mgr.authenticate_all()
+
+        with pytest.raises(RuntimeError, match="SessionIdentityManager has been closed"):
+            mgr.handle_response_auth_status(IDENTITY_PRIMARY, requests.Response())
+
+
 class TestAuthStoreRedisCompatibility:
     """Verifies Redis storage compatibility for both single and dual identities."""
 
@@ -275,6 +425,63 @@ class TestAuthStoreRedisCompatibility:
             both_p, both_s = get_scan_auth_both(scan_id)
             assert both_p == legacy_data
             assert both_s is None
+
+    def test_store_scan_auth_bounded_ttl_and_touch(self):
+        """Verifies that store_scan_auth enforces the bounded 14,400s (4 hours) TTL and touch refreshes it."""
+        scan_id = "test-ttl-scan"
+        auth = {"login_url": "https://test.com/login", "username": "admin"}
+
+        captured_ttl = {}
+        with patch("tasks.auth_store._r.setex", side_effect=lambda k, t, val: captured_ttl.update({k: t})), \
+             patch("tasks.auth_store._r.expire", side_effect=lambda k, t: True), \
+             patch("tasks.auth_store._r.ttl", return_value=DEFAULT_AUTH_TTL_SECONDS):
+
+            store_scan_auth(scan_id, auth=auth)
+            assert captured_ttl[f"scan_auth:{scan_id}"] == DEFAULT_AUTH_TTL_SECONDS
+            assert captured_ttl[f"scan_auth:{scan_id}"] == 14400
+
+            # touch_scan_auth refreshes TTL
+            assert touch_scan_auth(scan_id) is True
+            assert get_scan_auth_ttl(scan_id) == 14400
+
+    def test_reap_stuck_scans_deletes_credentials(self):
+        """Stuck-scan reaper deletes scan authentication credentials from Redis."""
+        from routers.scan import _reap_stuck_scans
+        mock_scan = MagicMock()
+        mock_scan.id = "stuck-scan-uuid"
+        mock_scan.started_at = None
+        mock_scan.created_at = None
+        mock_db = MagicMock()
+        mock_db.query.return_value.filter.return_value.all.return_value = [mock_scan]
+
+        with patch("routers.scan._is_waiting", return_value=False), \
+             patch("routers.scan.datetime") as mock_dt, \
+             patch("tasks.auth_store.delete_scan_auth") as mock_delete:
+            mock_dt.utcnow.return_value = datetime(2026, 1, 1, 12, 0, 0)
+            mock_scan.created_at = datetime(2026, 1, 1, 10, 0, 0)
+
+            reaped = _reap_stuck_scans(mock_db)
+            assert reaped == 1
+            mock_delete.assert_called_once_with("stuck-scan-uuid")
+
+    def test_cancel_scan_decision_deletes_credentials(self):
+        """Cancelling a scan via submit_scan_decision deletes scan credentials."""
+        from routers.scan import submit_scan_decision
+        from schemas import ScanDecisionRequest
+        mock_scan = MagicMock()
+        mock_scan.id = "cancel-scan-uuid"
+        mock_scan.domain = "test.domain"
+        mock_scan.status = "awaiting_user_decision"
+        mock_db = MagicMock()
+        mock_db.query.return_value.filter.return_value.first.return_value = mock_scan
+        mock_request = MagicMock()
+
+        req = ScanDecisionRequest(action="cancel")
+        with patch("routers.scan.get_owned_scan_or_404", return_value=mock_scan), \
+             patch("tasks.auth_store.delete_scan_auth") as mock_delete, \
+             patch("routers.scan.get_scan_status"):
+            submit_scan_decision("cancel-scan-uuid", req, mock_request, mock_db)
+            mock_delete.assert_called_once_with("cancel-scan-uuid")
 
 
 class TestScanRequestSchemaValidation:

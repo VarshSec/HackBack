@@ -535,6 +535,11 @@ def _finalize(results: list, scan_id: str, domain: str) -> None:
                 db.commit()
         except Exception:
             pass
+        try:
+            from tasks.auth_store import delete_scan_auth
+            delete_scan_auth(scan_id)
+        except Exception:
+            pass
     finally:
         db.close()
         # This scan just reached a terminal state and freed its slot - start the

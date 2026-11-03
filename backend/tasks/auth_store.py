@@ -22,8 +22,12 @@ import redis
 
 from config import settings
 
-_TTL_SECONDS = 2400  # comfortably past routers/scan.py's STUCK_SCAN_DEADLINE;
-                     # deleted explicitly in _finalize() regardless
+# Bounded TTL: comfortably past routers/scan.py's STUCK_SCAN_DEADLINE (3570s)
+# plus maximum queue wait headroom, while guaranteeing credentials are never
+# retained indefinitely. Default: 14,400s (4 hours).
+# Deleted explicitly during finalization, cancellation, reaping, and failure.
+DEFAULT_AUTH_TTL_SECONDS = getattr(settings, 'AUTH_CREDENTIAL_TTL_SECONDS', 14400)
+_TTL_SECONDS = DEFAULT_AUTH_TTL_SECONDS
 _r = redis.Redis.from_url(settings.REDIS_URL)
 
 
@@ -35,10 +39,12 @@ def store_scan_auth(
     scan_id: str,
     auth: Optional[dict] = None,
     auth_secondary: Optional[dict] = None,
+    ttl_seconds: Optional[int] = None,
 ) -> None:
     """
     Store authentication credentials for a scan in Redis under scan_auth:{scan_id}.
     Supports both legacy single-identity auth and dual-identity (primary + secondary) auth.
+    Uses bounded TTL (default 14,400s / 4 hours) to cover queue wait + scan execution.
     Never persists to PostgreSQL.
     """
     if auth is None and auth_secondary is None:
@@ -56,7 +62,25 @@ def store_scan_auth(
             'secondary': auth_secondary,
         }
 
-    _r.setex(_key(scan_id), _TTL_SECONDS, json.dumps(payload))
+    ttl = ttl_seconds if ttl_seconds is not None else DEFAULT_AUTH_TTL_SECONDS
+    _r.setex(_key(scan_id), ttl, json.dumps(payload))
+
+
+def touch_scan_auth(scan_id: str, ttl_seconds: Optional[int] = None) -> bool:
+    """
+    Refresh or extend the TTL on existing scan credentials in Redis.
+    Typically called when promoting a queued scan to active execution to ensure
+    it has fresh execution budget.
+    Returns True if the key existed and was refreshed, False otherwise.
+    """
+    key = _key(scan_id)
+    ttl = ttl_seconds if ttl_seconds is not None else DEFAULT_AUTH_TTL_SECONDS
+    return bool(_r.expire(key, ttl))
+
+
+def get_scan_auth_ttl(scan_id: str) -> int:
+    """Return remaining TTL in seconds for scan credentials, or -2 if key does not exist."""
+    return int(_r.ttl(_key(scan_id)))
 
 
 def get_scan_auth(scan_id: str, identity: str = 'primary') -> Optional[dict]:

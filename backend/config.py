@@ -108,6 +108,12 @@ class Settings(BaseSettings):
     # re-issued (seconds). Prevents a stale token lingering forever.
     DOMAIN_CHALLENGE_TTL_SECONDS: int = 3600
 
+    # Ephemeral scan authentication credentials TTL in Redis (tasks/auth_store.py).
+    # Comfortably bounds credential retention to cover queue waiting + execution
+    # (STUCK_SCAN_DEADLINE ~3570s + queue wait headroom) while guaranteeing credentials
+    # are never retained indefinitely. Default: 4 hours (14,400s).
+    AUTH_CREDENTIAL_TTL_SECONDS: int = 14400
+
     # ── Hosted multi-tenant auth (routers/auth.py). Default OFF, same spirit as
     # REQUIRE_DOMAIN_VERIFICATION above: HACKBACK is single-
     # operator and trusts its operator, so it stays tick-and-go — no signup, no

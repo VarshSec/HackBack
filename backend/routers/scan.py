@@ -113,6 +113,11 @@ def _reap_stuck_scans(db: Session) -> int:
         if reference_time and reference_time < cutoff:
             scan.status = ScanStatus.failed
             reaped += 1
+            try:
+                from tasks.auth_store import delete_scan_auth
+                delete_scan_auth(str(scan.id))
+            except Exception:
+                pass
     if reaped:
         db.commit()
         logger.warning("_reap_stuck_scans: marked %d stale scan(s) failed", reaped)
@@ -338,6 +343,11 @@ def create_scan(request: ScanRequest, http_request: Request, db: Session = Depen
         logger.error("Failed to enqueue scan task: %s", e)
         scan.status = ScanStatus.failed
         db.commit()
+        try:
+            from tasks.auth_store import delete_scan_auth
+            delete_scan_auth(str(scan.id))
+        except Exception:
+            pass
         raise HTTPException(status_code=500, detail="Failed to enqueue scan job")
 
     return ScanResponse(job_id=scan.id, status=scan.status.value, domain=scan.domain)
@@ -501,6 +511,11 @@ def get_scan_status(scan_id: UUID, http_request: Request, db: Session = Depends(
             )
             scan.status = ScanStatus.failed
             db.commit()
+            try:
+                from tasks.auth_store import delete_scan_auth
+                delete_scan_auth(str(scan.id))
+            except Exception:
+                pass
 
     module_errors = _compute_module_errors(scan)
     can_retry = None
@@ -552,6 +567,11 @@ def submit_scan_decision(scan_id: UUID, request: ScanDecisionRequest,
     elif request.action == "cancel":
         scan.status = ScanStatus.cancelled
         db.commit()
+        try:
+            from tasks.auth_store import delete_scan_auth
+            delete_scan_auth(scan_id)
+        except Exception:
+            pass
         # A cancel frees the slot this scan held - start the next in line.
         if settings.HOSTED_QUEUE_ENABLED:
             from tasks.queue_scheduler import promote_queued_scans
