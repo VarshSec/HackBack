@@ -532,8 +532,8 @@ Outbound HTTP scanners (`owasp.py`), authentication clients (`auth_login.py`), n
 
 ### 2. Web Scan Timeouts & Process Cleanup
 - `BoundedZAPv2`: Wraps ZAP API interactions with strict connect (5.0s) and read (25.0s) timeouts to prevent hangs on daemon disconnects.
-- `ThreadPoolExecutor`: Bounded by execution budget. If a scanner thread stalls, the executor does not block scan progression indefinitely.
-- Process tree termination: External subprocesses (Katana, Nikto) enforce timeouts with automatic process killing, and temporary artifact paths are cleanly unlinked in `finally` blocks.
+- `BoundedTaskRunner`: Runs sub-scanner tasks (ZAP, Katana, Nikto) in daemon threads with bounded execution deadlines. Eliminates ThreadPoolExecutor context manager wait-on-shutdown hangs (`__exit__` calling `shutdown(wait=True)`), guaranteeing stalled threads cannot hold `scan_webscan` beyond its budget.
+- Subprocess tracking & process tree termination: Active subprocesses are tracked in `_active_processes` registry. On timeout, Celery `SoftTimeLimitExceeded`, or module completion, `_terminate_scan_processes` cleanly terminates all running subprocesses and their descendants via `_kill_process_tree`, unlinking temporary output files in `/tmp`.
 - `SoftTimeLimitExceeded`: Handled gracefully to preserve all partial findings gathered up to the timeout.
 
 ### 3. Durable Module Results & Failure Recovery

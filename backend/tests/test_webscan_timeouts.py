@@ -65,35 +65,81 @@ class TestWebscanTimeoutAndPartialResults:
         assert res["findings"][0]["evidence"] == "XSS"
 
     def test_one_scanner_timeout_preserves_other_scanner_findings(self, monkeypatch):
-        # When ZAP succeeds and Katana future times out, ZAP findings must survive
+        # When ZAP succeeds and Katana times out, ZAP findings must survive
         def mock_run_zap(scan_id, domain, target_url, auth):
             return [
                 {"type": "zap_alert_1", "severity": "High", "evidence": "SQLi | http://target/"},
             ], "2.14.0", False
 
         def mock_slow_katana(scan_id, domain, target_url):
-            time.sleep(2)
+            time.sleep(10)
             return []
 
         monkeypatch.setattr("tasks.webscan._run_zap", mock_run_zap)
         monkeypatch.setattr("tasks.webscan._run_katana", mock_slow_katana)
-        monkeypatch.setattr("tasks.webscan._WEBSCAN_SOFT_LIMIT", 3)
+        monkeypatch.setattr("tasks.webscan._WEBSCAN_SOFT_LIMIT", 1)
         monkeypatch.setattr("tasks.webscan._NIKTO_TIMEOUT", 1)
 
-        # Mock concurrent.futures.wait to simulate katana timing out
-        import concurrent.futures
-        orig_wait = concurrent.futures.wait
-        def mock_wait(fs, timeout=None, return_when=None):
-            # pretend first future (zap) completed, second (katana) timed out
-            fs_list = list(fs)
-            return {fs_list[0]}, {fs_list[1]}
-
-        monkeypatch.setattr(concurrent.futures, "wait", mock_wait)
-
+        t0 = time.monotonic()
         res = scan_webscan("scan-t2", "example.com")
+        duration = time.monotonic() - t0
+
+        assert duration < 3.0, f"scan_webscan took too long: {duration}s"
         assert res["status"] == "partial"
         assert res["finding_count"] >= 1
         assert res["findings"][0]["type"] == "zap_alert_1"
+
+    def test_deliberately_blocked_worker_returns_within_deadline(self, monkeypatch):
+        """
+        Regression test: prove that scan_webscan returns strictly within its deadline
+        even when a worker thread is deliberately blocked indefinitely (e.g. infinite loop / hung socket).
+        """
+        def blocked_worker(*args, **kwargs):
+            while True:
+                time.sleep(0.1)
+
+        monkeypatch.setattr("tasks.webscan._run_zap", blocked_worker)
+        monkeypatch.setattr("tasks.webscan._run_katana", lambda *a, **k: [])
+        monkeypatch.setattr("tasks.webscan._run_nikto", lambda *a, **k: [])
+        monkeypatch.setattr("tasks.webscan._WEBSCAN_SOFT_LIMIT", 1)
+
+        t0 = time.monotonic()
+        res = scan_webscan("scan-blocked-1", "example.com")
+        elapsed = time.monotonic() - t0
+
+        assert elapsed < 2.5, f"Blocked worker held scan_webscan for {elapsed}s (must be < 2.5s)"
+        assert res["status"] in ("timeout", "partial")
+        assert "timed out" in res.get("error", "").lower()
+
+    def test_deliberately_blocked_worker_preserves_partial_findings(self, monkeypatch):
+        """
+        Regression test: prove that when one worker is blocked indefinitely,
+        findings from the other finished worker are completely preserved and returned as 'partial'.
+        """
+        mock_findings = [
+            {"type": "zap_finding_1", "severity": "High", "evidence": "SQLi proof", "found_by": ["webscan"]}
+        ]
+
+        def fast_zap(*args, **kwargs):
+            return mock_findings, "2.14.0", False
+
+        def blocked_katana(*args, **kwargs):
+            while True:
+                time.sleep(0.1)
+
+        monkeypatch.setattr("tasks.webscan._run_zap", fast_zap)
+        monkeypatch.setattr("tasks.webscan._run_katana", blocked_katana)
+        monkeypatch.setattr("tasks.webscan._run_nikto", lambda *a, **k: [])
+        monkeypatch.setattr("tasks.webscan._WEBSCAN_SOFT_LIMIT", 1)
+
+        t0 = time.monotonic()
+        res = scan_webscan("scan-blocked-2", "example.com")
+        elapsed = time.monotonic() - t0
+
+        assert elapsed < 2.5, f"Blocked worker held scan_webscan for {elapsed}s (must be < 2.5s)"
+        assert res["status"] == "partial"
+        assert res["finding_count"] == 1
+        assert res["findings"][0]["evidence"] == "SQLi proof"
 
     def test_clean_scan_status_is_success(self, monkeypatch):
         monkeypatch.setattr("tasks.webscan._run_zap", lambda *a, **k: ([], "2.14.0", False))

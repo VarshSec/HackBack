@@ -1,12 +1,14 @@
+import collections
 import json
 import logging
 import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 from urllib.parse import urljoin, quote
 
 import psutil
@@ -117,6 +119,69 @@ class ZAPv2(_BaseZAPv2):
 BoundedZAPv2 = ZAPv2
 
 
+class BoundedTaskRunner:
+    """Runs a task in a daemon thread with bounded execution semantics.
+    Unlike ThreadPoolExecutor, this runner NEVER blocks the caller upon timeout
+    or shutdown, ensuring the module execution strictly adheres to its deadline."""
+
+    def __init__(self, target, args=(), kwargs=None, name="bounded-worker"):
+        self.target = target
+        self.args = args
+        self.kwargs = kwargs or {}
+        self.name = name
+        self.result = None
+        self.error = None
+        self._thread = threading.Thread(target=self._exec, name=name, daemon=True)
+
+    def _exec(self):
+        try:
+            self.result = self.target(*self.args, **self.kwargs)
+        except Exception as e:
+            self.error = e
+
+    def start(self):
+        self._thread.start()
+
+    def join(self, timeout=None):
+        self._thread.join(timeout=timeout)
+
+    @property
+    def is_alive(self):
+        return self._thread.is_alive()
+
+
+_active_processes: Dict[str, Set[subprocess.Popen]] = collections.defaultdict(set)
+_active_processes_lock = threading.Lock()
+
+
+def _register_scan_process(scan_id: str, proc: Optional[subprocess.Popen]) -> None:
+    if proc is None:
+        return
+    with _active_processes_lock:
+        _active_processes[scan_id].add(proc)
+
+
+def _unregister_scan_process(scan_id: str, proc: Optional[subprocess.Popen]) -> None:
+    if proc is None:
+        return
+    with _active_processes_lock:
+        if scan_id in _active_processes:
+            _active_processes[scan_id].discard(proc)
+
+
+def _terminate_scan_processes(scan_id: str) -> None:
+    with _active_processes_lock:
+        procs = list(_active_processes.pop(scan_id, set()))
+    for proc in procs:
+        _kill_process_tree(proc)
+    for pattern in [f'/tmp/katana_{scan_id}.txt', f'/tmp/nikto_{scan_id}.json']:
+        if os.path.exists(pattern):
+            try:
+                os.unlink(pattern)
+            except OSError:
+                pass
+
+
 def _kill_process_tree(proc_or_pid, timeout: float = 5.0) -> None:
     """Terminate a process and all its descendants cleanly."""
     if proc_or_pid is None:
@@ -186,6 +251,7 @@ def _start_zap(scan_id: str, port: int) -> Optional[subprocess.Popen]:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
+        _register_scan_process(scan_id, proc)
         logger.info("ZAP daemon started (pid=%d) on port %d for scan %s",
                     proc.pid, port, scan_id)
         return proc
@@ -809,38 +875,42 @@ def scan_webscan(scan_id: str, domain: str, auth: dict = None) -> dict:
     katana_failed = False
 
     try:
-        pool_budget = max(10, int(_WEBSCAN_SOFT_LIMIT - (time.monotonic() - start) - _NIKTO_TIMEOUT - 5))
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            zap_future = executor.submit(_run_zap, scan_id, domain, target_url, auth)
-            katana_future = executor.submit(_run_katana, scan_id, domain, target_url)
+        total_budget = max(1, int(_WEBSCAN_SOFT_LIMIT - (time.monotonic() - start)))
+        pool_budget = max(1, int(total_budget * 0.6)) if total_budget <= 20 else max(10, int(total_budget - _NIKTO_TIMEOUT - 5))
 
-            done, not_done = concurrent.futures.wait(
-                [zap_future, katana_future],
-                timeout=pool_budget,
-                return_when=concurrent.futures.ALL_COMPLETED,
-            )
+        zap_runner = BoundedTaskRunner(_run_zap, args=(scan_id, domain, target_url, auth), name=f"zap-{scan_id}")
+        katana_runner = BoundedTaskRunner(_run_katana, args=(scan_id, domain, target_url), name=f"katana-{scan_id}")
 
-            if zap_future in done:
-                try:
-                    zap_findings, zap_version, zap_disconnected = zap_future.result()
-                except Exception as e:
-                    logger.error("ZAP thread failed for scan %s: %s", scan_id, e)
-                    zap_failed = True
+        zap_runner.start()
+        katana_runner.start()
+
+        deadline = time.monotonic() + pool_budget
+        while time.monotonic() < deadline:
+            if not zap_runner.is_alive and not katana_runner.is_alive:
+                break
+            time.sleep(0.05)
+
+        if zap_runner.is_alive:
+            logger.warning("ZAP worker exceeded budget (%ds) for scan %s", pool_budget, scan_id)
+            zap_timed_out = True
+            _terminate_scan_processes(scan_id)
+        else:
+            if zap_runner.error:
+                logger.error("ZAP worker failed for scan %s: %s", scan_id, zap_runner.error)
+                zap_failed = True
             else:
-                logger.warning("ZAP thread exceeded budget (%ds) for scan %s", pool_budget, scan_id)
-                zap_timed_out = True
-                zap_future.cancel()
+                zap_findings, zap_version, zap_disconnected = zap_runner.result or ([], None, False)
 
-            if katana_future in done:
-                try:
-                    katana_findings = katana_future.result()
-                except Exception as e:
-                    logger.error("Katana thread failed for scan %s: %s", scan_id, e)
-                    katana_failed = True
+        if katana_runner.is_alive:
+            logger.warning("Katana worker exceeded budget (%ds) for scan %s", pool_budget, scan_id)
+            katana_timed_out = True
+            _terminate_scan_processes(scan_id)
+        else:
+            if katana_runner.error:
+                logger.error("Katana worker failed for scan %s: %s", scan_id, katana_runner.error)
+                katana_failed = True
             else:
-                logger.warning("Katana thread exceeded budget (%ds) for scan %s", pool_budget, scan_id)
-                katana_timed_out = True
-                katana_future.cancel()
+                katana_findings = katana_runner.result or []
 
         findings.extend(zap_findings)
         findings.extend(katana_findings)
@@ -849,11 +919,23 @@ def scan_webscan(scan_id: str, domain: str, auth: dict = None) -> dict:
             findings.append(hidden_finding)
 
         remaining = _WEBSCAN_SOFT_LIMIT - (time.monotonic() - start)
-        if remaining > 15:
-            nikto_findings = _run_nikto(scan_id, domain, target_url)
-            findings.extend(nikto_findings)
+        if remaining > 15 and not (zap_timed_out and katana_timed_out):
+            nikto_budget = min(_NIKTO_TIMEOUT, max(5, int(remaining - 5)))
+            nikto_runner = BoundedTaskRunner(_run_nikto, args=(scan_id, domain, target_url), name=f"nikto-{scan_id}")
+            nikto_runner.start()
+            nikto_deadline = time.monotonic() + nikto_budget
+            while time.monotonic() < nikto_deadline:
+                if not nikto_runner.is_alive:
+                    break
+                time.sleep(0.05)
+            if nikto_runner.is_alive:
+                logger.warning("Nikto worker exceeded budget (%ds) for scan %s", nikto_budget, scan_id)
+                _terminate_scan_processes(scan_id)
+            elif not nikto_runner.error and nikto_runner.result:
+                nikto_findings = nikto_runner.result
+                findings.extend(nikto_findings)
         else:
-            logger.warning("Skipping Nikto for scan %s - remaining budget %ds < 15s", scan_id, remaining)
+            logger.warning("Skipping Nikto for scan %s - remaining budget %ds < 15s or sub-scanners timed out", scan_id, remaining)
 
         tool_versions = {
             'zap':    zap_version or 'unknown',
@@ -889,6 +971,7 @@ def scan_webscan(scan_id: str, domain: str, auth: dict = None) -> dict:
     except SoftTimeLimitExceeded:
         logger.warning("webscan hit its soft time limit (%ds) for scan %s",
                         _WEBSCAN_SOFT_LIMIT, scan_id)
+        _terminate_scan_processes(scan_id)
         status = 'partial' if findings else 'timeout'
         return build_module_result(
             MODULE, findings, {}, status=status,
@@ -896,9 +979,12 @@ def scan_webscan(scan_id: str, domain: str, auth: dict = None) -> dict:
             duration_seconds=time.monotonic() - start)
     except Exception as e:
         logger.exception("webscan unexpected error scan=%s: %s", scan_id, e)
+        _terminate_scan_processes(scan_id)
         status = 'partial' if findings else 'failed'
         return build_module_result(MODULE, findings, {}, status=status,
                                     error=str(e), duration_seconds=time.monotonic() - start)
+    finally:
+        _terminate_scan_processes(scan_id)
 
 
 @app.task(
