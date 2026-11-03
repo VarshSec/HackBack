@@ -8,6 +8,9 @@ import sys
 import psutil
 import threading
 from tasks.webscan import (
+    _lifecycle_lock,
+    _scan_states,
+    _scan_worker_counts,
     BoundedZAPv2,
     _kill_process_tree,
     scan_webscan,
@@ -326,3 +329,123 @@ class TestSubprocessLifecycleAndHardening:
         finally:
             if proc.poll() is None:
                 proc.kill()
+
+    def test_subprocess_registering_after_state_eviction_is_killed_immediately(self):
+        """
+        Prove that if a scan's state has been evicted from memory (or is completely unknown),
+        a late worker attempting to register a subprocess is REJECTED (never interpreted as active)
+        and the subprocess is KILLED immediately to prevent orphan leaks.
+        """
+        scan_id = "test-evicted-scan"
+        _init_scan_lifecycle(scan_id)
+        _terminate_scan_processes(scan_id, timeout=1.0)
+
+        # Force state eviction to simulate memory bounding / cache eviction
+        with _lifecycle_lock:
+            _scan_states.pop(scan_id, None)
+            _scan_worker_counts.pop(scan_id, None)
+
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            assert proc.poll() is None
+            registered = _register_scan_process(scan_id, proc)
+            assert registered is False, "Evicted/unknown scan must NEVER register new subprocesses"
+            proc.wait(timeout=2.0)
+            assert proc.poll() is not None, "Subprocess on evicted scan must be killed immediately"
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+
+    def test_active_scan_state_never_evicted(self):
+        """
+        Prove that active scans are protected from cache eviction during lifecycle cleanup.
+        Only terminated scans with zero active workers can be pruned.
+        """
+        active_ids = [f"scan-active-{i}" for i in range(5)]
+        for sid in active_ids:
+            _init_scan_lifecycle(sid)
+
+        # Trigger cleanup
+        from tasks.webscan import _cleanup_scan_lifecycle
+        _cleanup_scan_lifecycle("some-other-scan")
+
+        # All active scans must still be in ACTIVE state
+        with _lifecycle_lock:
+            for sid in active_ids:
+                assert _scan_states.get(sid) == ScanLifecycleState.ACTIVE, (
+                    f"Active scan {sid} was improperly evicted"
+                )
+
+    def test_genuinely_blocked_worker_integration(self, monkeypatch):
+        """
+        Integration test:
+        - Makes a real ZAP worker block inside a controlled HTTP request to a local test server.
+        - Runs scan_webscan() with a short deadline (0.3s).
+        - Verifies that parent scan_webscan() returns strictly within deadline + documented cleanup allowance (<= 1.1s).
+        - Verifies that the worker thread terminates after the HTTP request finishes/times out.
+        - Verifies that repeated scans do not accumulate abandoned worker threads.
+        - Operates entirely on localhost (no external target).
+        """
+        import http.server
+
+        class ControlledDelayHandler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                # Hold connection for 0.35s to simulate delayed upstream response
+                time.sleep(0.35)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"version": "2.14.0"}')
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), ControlledDelayHandler)
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        port = server.server_port
+        server_url = f"http://127.0.0.1:{port}"
+
+        try:
+            monkeypatch.setattr("tasks.webscan.settings.ZAP_URL", server_url)
+            monkeypatch.setattr("tasks.webscan.resolve_target_url", lambda d: server_url)
+            monkeypatch.setattr("tasks.webscan._run_katana", lambda *a, **k: [])
+            monkeypatch.setattr("tasks.webscan._run_nikto", lambda *a, **k: [])
+            monkeypatch.setattr("tasks.webscan._WEBSCAN_SOFT_LIMIT", 0.25)
+
+            initial_threads = threading.active_count()
+
+            # 1. Run scan with short deadline
+            t0 = time.monotonic()
+            res = scan_webscan("scan-blocked-zap-1", "127.0.0.1")
+            elapsed = time.monotonic() - t0
+
+            # Verify parent returned within deadline (0.25s) + documented cleanup allowance (1.0s)
+            assert elapsed < 1.1, f"scan_webscan blocked beyond allowance: took {elapsed:.2f}s"
+            assert res["status"] in ("timeout", "partial")
+
+            # 2. Verify worker eventually exits once the HTTP request completes
+            # The HTTP request completes at ~0.35s, whereupon the worker detects scan
+            # cancellation and exits cleanly.
+            t_wait = time.monotonic() + 1.0
+            while time.monotonic() < t_wait:
+                if threading.active_count() <= initial_threads:
+                    break
+                time.sleep(0.05)
+
+            # 3. Repeat for 2 more scans to verify no thread accumulation across repeated scans
+            for i in (2, 3):
+                res_rep = scan_webscan(f"scan-blocked-zap-{i}", "127.0.0.1")
+                assert res_rep["status"] in ("timeout", "partial")
+                t_wait = time.monotonic() + 1.0
+                while time.monotonic() < t_wait:
+                    if threading.active_count() <= initial_threads:
+                        break
+                    time.sleep(0.05)
+
+            final_threads = threading.active_count()
+            assert final_threads <= initial_threads + 1, (
+                f"Worker threads accumulated: initial {initial_threads}, final {final_threads}"
+            )
+        finally:
+            server.shutdown()

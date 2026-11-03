@@ -95,6 +95,9 @@ class ZAPv2(_BaseZAPv2):
     """ZAPv2 client enforcing bounded connection and read timeouts on all API requests."""
 
     def _request_api(self, url, query=None, method="GET", body=None):
+        scan_id = getattr(_thread_local, 'scan_id', None)
+        if scan_id and _is_scan_cancelled(scan_id):
+            raise RuntimeError(f"Scan {scan_id} cancelled")
         if not url.startswith('http://zap/'):
             raise ValueError('A non ZAP API url was specified ' + url)
         with requests.Session() as session:
@@ -108,6 +111,8 @@ class ZAPv2(_BaseZAPv2):
                 verify=False,
                 timeout=(_ZAP_API_CONNECT_TIMEOUT, _ZAP_API_READ_TIMEOUT),
             )
+        if scan_id and _is_scan_cancelled(scan_id):
+            raise RuntimeError(f"Scan {scan_id} cancelled")
         validate_status = getattr(self, '_ZAPv2__validate_status_code', False)
         if validate_status and 300 <= response.status_code < 500:
             raise Exception(f"Non-successful status code returned from ZAP: {response.status_code} response: {response.text}")
@@ -124,20 +129,26 @@ class BoundedTaskRunner:
     Unlike ThreadPoolExecutor, this runner NEVER blocks the caller upon timeout
     or shutdown, ensuring the module execution strictly adheres to its deadline."""
 
-    def __init__(self, target, args=(), kwargs=None, name="bounded-worker"):
+    def __init__(self, target, args=(), kwargs=None, name="bounded-worker", scan_id=None):
         self.target = target
         self.args = args
         self.kwargs = kwargs or {}
         self.name = name
+        self.scan_id = scan_id
         self.result = None
         self.error = None
         self._thread = threading.Thread(target=self._exec, name=name, daemon=True)
 
     def _exec(self):
+        if self.scan_id:
+            _enter_scan_worker(self.scan_id)
         try:
             self.result = self.target(*self.args, **self.kwargs)
         except Exception as e:
             self.error = e
+        finally:
+            if self.scan_id:
+                _exit_scan_worker(self.scan_id)
 
     def start(self):
         self._thread.start()
@@ -159,6 +170,7 @@ _scan_states: Dict[str, str] = {}
 _scan_abort_events: Dict[str, threading.Event] = {}
 _active_processes: Dict[str, Set[subprocess.Popen]] = collections.defaultdict(set)
 _scan_cleanup_errors: Dict[str, List[str]] = collections.defaultdict(list)
+_scan_worker_counts: Dict[str, int] = collections.defaultdict(int)
 _lifecycle_lock = threading.Lock()
 _thread_local = threading.local()
 
@@ -170,7 +182,22 @@ def _init_scan_lifecycle(scan_id: str) -> threading.Event:
         _scan_abort_events[scan_id] = abort_ev
         _active_processes[scan_id] = set()
         _scan_cleanup_errors[scan_id] = []
+        _scan_worker_counts[scan_id] = 0
         return abort_ev
+
+
+def _enter_scan_worker(scan_id: str) -> bool:
+    with _lifecycle_lock:
+        if _scan_states.get(scan_id) != ScanLifecycleState.ACTIVE:
+            return False
+        _scan_worker_counts[scan_id] = _scan_worker_counts.get(scan_id, 0) + 1
+        return True
+
+
+def _exit_scan_worker(scan_id: str) -> None:
+    with _lifecycle_lock:
+        if scan_id in _scan_worker_counts:
+            _scan_worker_counts[scan_id] = max(0, _scan_worker_counts[scan_id] - 1)
 
 
 def _is_scan_cancelled(scan_id: str) -> bool:
@@ -178,21 +205,24 @@ def _is_scan_cancelled(scan_id: str) -> bool:
         return _scan_states.get(scan_id) == ScanLifecycleState.TERMINATED
 
 
-def _register_scan_process(scan_id: str, proc: Optional[subprocess.Popen]) -> bool:
+def _register_scan_process(scan_id: str, proc: Optional[subprocess.Popen],
+                           deadline: Optional[float] = None) -> bool:
     """
     Register a newly spawned subprocess for tracking during scan execution.
-    If the scan has already been cancelled/terminated, the subprocess is
-    TERMINATED IMMEDIATELY to prevent orphan leak races.
-    Returns True if successfully registered, False if terminated early or None.
+    Only scans in ScanLifecycleState.ACTIVE may register subprocesses.
+    If the scan is terminated, cancelled, unknown, or expired/evicted, registration
+    is rejected and the subprocess is TERMINATED IMMEDIATELY to prevent orphan leaks.
+    Never interprets an unknown or expired scan ID as automatically ACTIVE.
+    Returns True if successfully registered, False if rejected and terminated.
     """
     if proc is None:
         return False
     with _lifecycle_lock:
-        state = _scan_states.get(scan_id, ScanLifecycleState.ACTIVE)
-        if state == ScanLifecycleState.TERMINATED:
-            logger.warning("Scan %s already terminated; killing late subprocess (pid=%s)",
-                           scan_id, getattr(proc, 'pid', 'unknown'))
-            _kill_process_tree(proc, timeout=1.0)
+        state = _scan_states.get(scan_id)
+        if state != ScanLifecycleState.ACTIVE:
+            logger.warning("Scan %s is not active (state=%s); killing late/untracked subprocess (pid=%s)",
+                           scan_id, state or "UNKNOWN/EXPIRED", getattr(proc, 'pid', 'unknown'))
+            _kill_process_tree(proc, timeout=0.5, deadline=deadline)
             return False
         _active_processes[scan_id].add(proc)
         return True
@@ -206,15 +236,30 @@ def _unregister_scan_process(scan_id: str, proc: Optional[subprocess.Popen]) -> 
             _active_processes[scan_id].discard(proc)
 
 
-def _terminate_scan_processes(scan_id: str, timeout: float = 3.0) -> List[int]:
+def _terminate_scan_processes(scan_id: str, timeout: Optional[float] = None,
+                              deadline: Optional[float] = None) -> List[int]:
     """
     Terminates all processes associated with scan_id using a SHARED monotonic deadline.
     Prevents serial wait multiplication across multiple processes.
+    Passes a single absolute monotonic deadline through discovery, SIGTERM, wait,
+    and SIGKILL escalation without resetting per-process deadlines or imposing
+    artificial minimum waits that can breach the parent scan budget.
+
+    OS process termination is best-effort: if the operating system does not finish
+    terminating and reaping processes within the remaining deadline budget, surviving
+    PIDs are recorded in surviving_pids and returned for envelope reporting.
+
     Sets the scan state to TERMINATED and signals its abort_event so any late
     processes or polling loops terminate immediately.
     Returns a list of surviving PIDs (if any).
     """
-    cleanup_deadline = time.monotonic() + max(0.5, timeout)
+    if deadline is not None:
+        cleanup_deadline = deadline
+    elif timeout is not None:
+        cleanup_deadline = time.monotonic() + max(0.0, timeout)
+    else:
+        cleanup_deadline = time.monotonic() + 3.0
+
     surviving_pids: List[int] = []
 
     with _lifecycle_lock:
@@ -265,10 +310,13 @@ def _terminate_scan_processes(scan_id: str, timeout: float = 3.0) -> List[int]:
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             pass
 
-    # 3. Collective wait using remaining shared deadline
-    remaining = max(0.05, cleanup_deadline - time.monotonic())
-    term_timeout = min(remaining * 0.8, 2.0)
-    gone, alive = psutil.wait_procs(all_psutil_procs, timeout=term_timeout)
+    # 3. Collective wait using remaining shared deadline (no minimum wait inflation)
+    rem = cleanup_deadline - time.monotonic()
+    if rem > 0:
+        term_timeout = min(rem * 0.7, 1.5)
+        gone, alive = psutil.wait_procs(all_psutil_procs, timeout=term_timeout)
+    else:
+        gone, alive = psutil.wait_procs(all_psutil_procs, timeout=0)
 
     # 4. Immediate parallel SIGKILL for any survivors
     if alive:
@@ -277,8 +325,11 @@ def _terminate_scan_processes(scan_id: str, timeout: float = 3.0) -> List[int]:
                 proc.kill()
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 pass
-        kill_timeout = max(0.05, cleanup_deadline - time.monotonic())
-        gone2, still_alive = psutil.wait_procs(alive, timeout=min(kill_timeout, 1.0))
+        rem_kill = cleanup_deadline - time.monotonic()
+        if rem_kill > 0:
+            gone2, still_alive = psutil.wait_procs(alive, timeout=min(rem_kill, 1.0))
+        else:
+            gone2, still_alive = psutil.wait_procs(alive, timeout=0)
         for p in still_alive:
             try:
                 if p.is_running():
@@ -311,20 +362,49 @@ def _terminate_scan_processes(scan_id: str, timeout: float = 3.0) -> List[int]:
 
 
 def _cleanup_scan_lifecycle(scan_id: str) -> None:
+    """
+    Cleans up scan lifecycle resources.
+    Preserves cancellation state (TERMINATED) while any worker threads are still running.
+    Never evicts active scans.
+    Prunes only fully terminated scans that have zero active workers.
+    """
     with _lifecycle_lock:
         _scan_abort_events.pop(scan_id, None)
         _active_processes.pop(scan_id, None)
-        if len(_scan_states) > 500:
-            for k in list(_scan_states.keys())[:250]:
-                _scan_states.pop(k, None)
-                _scan_cleanup_errors.pop(k, None)
+
+        # If scan still has workers running, preserve TERMINATED state until they exit
+        if _scan_worker_counts.get(scan_id, 0) > 0:
+            _scan_states[scan_id] = ScanLifecycleState.TERMINATED
+            return
+
+        # Scans with zero workers can be cleanly marked TERMINATED
+        _scan_worker_counts.pop(scan_id, None)
+        _scan_states[scan_id] = ScanLifecycleState.TERMINATED
+
+        # Bounded eviction: NEVER evict ACTIVE scans, only TERMINATED with 0 active workers
+        if len(_scan_states) > 1000:
+            evictable = [
+                sid for sid, st in _scan_states.items()
+                if st == ScanLifecycleState.TERMINATED and _scan_worker_counts.get(sid, 0) == 0
+            ]
+            for sid in evictable[:250]:
+                _scan_states.pop(sid, None)
+                _scan_cleanup_errors.pop(sid, None)
+                _scan_worker_counts.pop(sid, None)
 
 
-def _kill_process_tree(proc_or_pid, timeout: float = 2.0) -> None:
-    """Terminate a process and all its descendants cleanly within bounded timeout."""
+def _kill_process_tree(proc_or_pid, timeout: float = 2.0, deadline: Optional[float] = None) -> None:
+    """
+    Terminate a process and all its descendants cleanly within bounded deadline.
+    OS process termination is best-effort within the allocated time.
+    """
     if proc_or_pid is None:
         return
-    deadline = time.monotonic() + max(0.1, timeout)
+    if deadline is not None:
+        proc_deadline = deadline
+    else:
+        proc_deadline = time.monotonic() + max(0.0, timeout)
+
     try:
         pid = proc_or_pid.pid if hasattr(proc_or_pid, 'pid') else proc_or_pid
         if not isinstance(pid, int):
@@ -347,13 +427,23 @@ def _kill_process_tree(proc_or_pid, timeout: float = 2.0) -> None:
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 pass
 
-        rem = max(0.05, deadline - time.monotonic())
-        gone, alive = psutil.wait_procs(procs, timeout=rem)
+        rem = proc_deadline - time.monotonic()
+        if rem > 0:
+            gone, alive = psutil.wait_procs(procs, timeout=min(rem, timeout))
+        else:
+            gone, alive = psutil.wait_procs(procs, timeout=0)
+
         for p in alive:
             try:
                 p.kill()
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 pass
+
+        rem_kill = proc_deadline - time.monotonic()
+        if rem_kill > 0:
+            psutil.wait_procs(alive, timeout=min(rem_kill, 0.5))
+        else:
+            psutil.wait_procs(alive, timeout=0)
     except (psutil.NoSuchProcess, psutil.AccessDenied):
         pass
     except Exception as e:
@@ -366,13 +456,13 @@ def _kill_process_tree(proc_or_pid, timeout: float = 2.0) -> None:
                 pass
 
 
-def _kill_zap(proc: Optional[subprocess.Popen]) -> None:
+def _kill_zap(proc: Optional[subprocess.Popen], deadline: Optional[float] = None) -> None:
     """
     Terminate the ZAP daemon and all its children: graceful SIGTERM first,
     then SIGKILL after 5s, then reap the Popen so it can't become a zombie.
     Never raises - called from finally blocks.
     """
-    _kill_process_tree(proc, timeout=5.0)
+    _kill_process_tree(proc, timeout=5.0, deadline=deadline)
 
 
 def _start_zap(scan_id: str, port: int) -> Optional[subprocess.Popen]:
@@ -429,10 +519,13 @@ def _wait_for_zap(base_url: str, timeout: int = _ZAP_READY_TIMEOUT, scan_id: Opt
             abort_event = _scan_abort_events.get(scan_id)
 
     while time.monotonic() < deadline:
-        if abort_event and abort_event.is_set():
+        if (abort_event and abort_event.is_set()) or (scan_id and _is_scan_cancelled(scan_id)):
             return False
         try:
-            r = requests.get(url, timeout=2)
+            req_timeout = min(2.0, max(0.1, deadline - time.monotonic()))
+            r = requests.get(url, timeout=req_timeout)
+            if (abort_event and abort_event.is_set()) or (scan_id and _is_scan_cancelled(scan_id)):
+                return False
             if r.status_code == 200:
                 logger.info("ZAP ready at %s", base_url)
                 return True
@@ -441,6 +534,8 @@ def _wait_for_zap(base_url: str, timeout: int = _ZAP_READY_TIMEOUT, scan_id: Opt
         if abort_event:
             if abort_event.wait(timeout=2):
                 return False
+        elif scan_id and _is_scan_cancelled(scan_id):
+            return False
         else:
             time.sleep(2)
     logger.warning("ZAP did not become ready within %ds at %s", timeout, base_url)
@@ -578,6 +673,9 @@ def _run_zap(scan_id: str, domain: str, target_url: str, auth: Optional[dict] = 
                 logger.warning("Remote ZAP not ready for scan %s - skipping ZAP", scan_id)
                 return findings, zap_version, disconnected_mid_scan
 
+            if _is_scan_cancelled(scan_id):
+                return findings, zap_version, disconnected_mid_scan
+
             zap = ZAPv2(
                 apikey='',
                 proxies={'http': remote_zap_url, 'https': remote_zap_url},
@@ -596,6 +694,9 @@ def _run_zap(scan_id: str, domain: str, target_url: str, auth: Optional[dict] = 
             local_base_url = f'http://localhost:{port}'
             if not _wait_for_zap(local_base_url, timeout=_ZAP_READY_TIMEOUT):
                 logger.warning("ZAP not ready for scan %s - skipping ZAP", scan_id)
+                return findings, zap_version, disconnected_mid_scan
+
+            if _is_scan_cancelled(scan_id):
                 return findings, zap_version, disconnected_mid_scan
 
             zap = ZAPv2(
@@ -733,6 +834,9 @@ def _run_zap(scan_id: str, domain: str, target_url: str, auth: Optional[dict] = 
 
         scan_deadline = time.monotonic() + _ZAP_SCAN_BUDGET
 
+        if _is_scan_cancelled(scan_id):
+            return findings, zap_version, disconnected_mid_scan
+
         # --- Spider ---
         logger.info("ZAP spider starting for scan %s", scan_id)
         spider_id = zap.spider.scan(target_url)
@@ -759,6 +863,8 @@ def _run_zap(scan_id: str, domain: str, target_url: str, auth: Optional[dict] = 
         # raise into the outer handler and lose the alerts we can still try to
         # collect below); we fall straight through to alert collection.
         if not disconnected_mid_scan and time.monotonic() < scan_deadline:
+            if _is_scan_cancelled(scan_id):
+                return findings, zap_version, disconnected_mid_scan
             logger.info("ZAP active scan starting for scan %s", scan_id)
             ascan_id = zap.ascan.scan(target_url)
             if not _is_zap_scan_id(ascan_id):
@@ -782,6 +888,8 @@ def _run_zap(scan_id: str, domain: str, target_url: str, auth: Optional[dict] = 
                                    "- collecting alerts found so far", scan_id)
 
         # --- Collect alerts (whatever exists, even on a budget cut) ---
+        if _is_scan_cancelled(scan_id):
+            return findings, zap_version, disconnected_mid_scan
         try:
             alerts = zap.core.alerts(baseurl=target_url)
             if not isinstance(alerts, list):
@@ -840,6 +948,8 @@ def _run_katana(scan_id: str, domain: str, target_url: str) -> List[dict]:
     finding['technology']) so run_webscan can diff them against ZAP's URLs
     once both threads finish, to flag JS-only routes as 'js_hidden_endpoints'.
     """
+    if _is_scan_cancelled(scan_id):
+        return []
     findings = []
     out_path = f'/tmp/katana_{scan_id}.txt'
     proc = None
@@ -941,6 +1051,8 @@ def _js_hidden_endpoints_finding(domain: str, zap_findings: List[dict],
 
 def _run_nikto(scan_id: str, domain: str, target_url: str) -> List[dict]:
     """Run Nikto and return normalized findings."""
+    if _is_scan_cancelled(scan_id):
+        return []
     findings = []
     out_path = f'/tmp/nikto_{scan_id}.json'
     proc = None
@@ -1108,11 +1220,15 @@ def scan_webscan(scan_id: str, domain: str, auth: dict = None) -> dict:
     katana_failed = False
 
     try:
-        total_budget = max(1, int(_WEBSCAN_SOFT_LIMIT - (time.monotonic() - start)))
-        pool_budget = max(1, int(total_budget * 0.6)) if total_budget <= 20 else max(10, int(total_budget - _NIKTO_TIMEOUT - 5))
+        _WEBSCAN_CLEANUP_ALLOWANCE = 1.0  # Documented maximum allowance for best-effort cleanup
+        task_deadline = start + _WEBSCAN_SOFT_LIMIT
+        cleanup_deadline = task_deadline + _WEBSCAN_CLEANUP_ALLOWANCE
 
-        zap_runner = BoundedTaskRunner(_run_zap, args=(scan_id, domain, target_url, auth), name=f"zap-{scan_id}")
-        katana_runner = BoundedTaskRunner(_run_katana, args=(scan_id, domain, target_url), name=f"katana-{scan_id}")
+        total_budget = max(0.1, _WEBSCAN_SOFT_LIMIT - (time.monotonic() - start))
+        pool_budget = max(0.1, total_budget * 0.6) if total_budget <= 20 else max(10, total_budget - _NIKTO_TIMEOUT - 5)
+
+        zap_runner = BoundedTaskRunner(_run_zap, args=(scan_id, domain, target_url, auth), name=f"zap-{scan_id}", scan_id=scan_id)
+        katana_runner = BoundedTaskRunner(_run_katana, args=(scan_id, domain, target_url), name=f"katana-{scan_id}", scan_id=scan_id)
 
         zap_runner.start()
         katana_runner.start()
@@ -1123,12 +1239,12 @@ def scan_webscan(scan_id: str, domain: str, auth: dict = None) -> dict:
                 break
             time.sleep(0.05)
 
-        cleanup_budget = min(3.0, max(0.5, _WEBSCAN_SOFT_LIMIT - (time.monotonic() - start)))
+        cur_cleanup_deadline = min(time.monotonic() + _WEBSCAN_CLEANUP_ALLOWANCE, cleanup_deadline)
 
         if zap_runner.is_alive:
             logger.warning("ZAP worker exceeded budget (%ds) for scan %s", pool_budget, scan_id)
             zap_timed_out = True
-            _terminate_scan_processes(scan_id, timeout=cleanup_budget)
+            _terminate_scan_processes(scan_id, deadline=cur_cleanup_deadline)
         else:
             if zap_runner.error:
                 logger.error("ZAP worker failed for scan %s: %s", scan_id, zap_runner.error)
@@ -1139,7 +1255,7 @@ def scan_webscan(scan_id: str, domain: str, auth: dict = None) -> dict:
         if katana_runner.is_alive:
             logger.warning("Katana worker exceeded budget (%ds) for scan %s", pool_budget, scan_id)
             katana_timed_out = True
-            _terminate_scan_processes(scan_id, timeout=cleanup_budget)
+            _terminate_scan_processes(scan_id, deadline=cur_cleanup_deadline)
         else:
             if katana_runner.error:
                 logger.error("Katana worker failed for scan %s: %s", scan_id, katana_runner.error)
@@ -1156,7 +1272,7 @@ def scan_webscan(scan_id: str, domain: str, auth: dict = None) -> dict:
         remaining = _WEBSCAN_SOFT_LIMIT - (time.monotonic() - start)
         if remaining > 15 and not (zap_timed_out and katana_timed_out):
             nikto_budget = min(_NIKTO_TIMEOUT, max(5, int(remaining - 5)))
-            nikto_runner = BoundedTaskRunner(_run_nikto, args=(scan_id, domain, target_url), name=f"nikto-{scan_id}")
+            nikto_runner = BoundedTaskRunner(_run_nikto, args=(scan_id, domain, target_url), name=f"nikto-{scan_id}", scan_id=scan_id)
             nikto_runner.start()
             nikto_deadline = time.monotonic() + nikto_budget
             while time.monotonic() < nikto_deadline:
@@ -1165,7 +1281,7 @@ def scan_webscan(scan_id: str, domain: str, auth: dict = None) -> dict:
                 time.sleep(0.05)
             if nikto_runner.is_alive:
                 logger.warning("Nikto worker exceeded budget (%ds) for scan %s", nikto_budget, scan_id)
-                _terminate_scan_processes(scan_id, timeout=cleanup_budget)
+                _terminate_scan_processes(scan_id, deadline=cur_cleanup_deadline)
             elif not nikto_runner.error and nikto_runner.result:
                 nikto_findings = nikto_runner.result
                 findings.extend(nikto_findings)
@@ -1206,7 +1322,7 @@ def scan_webscan(scan_id: str, domain: str, auth: dict = None) -> dict:
     except SoftTimeLimitExceeded:
         logger.warning("webscan hit its soft time limit (%ds) for scan %s",
                         _WEBSCAN_SOFT_LIMIT, scan_id)
-        _terminate_scan_processes(scan_id, timeout=1.5)
+        _terminate_scan_processes(scan_id, deadline=time.monotonic() + 0.5)
         status = 'partial' if findings else 'timeout'
         return _attach_cleanup_info(build_module_result(
             MODULE, findings, {}, status=status,
@@ -1214,13 +1330,12 @@ def scan_webscan(scan_id: str, domain: str, auth: dict = None) -> dict:
             duration_seconds=time.monotonic() - start))
     except Exception as e:
         logger.exception("webscan unexpected error scan=%s: %s", scan_id, e)
-        _terminate_scan_processes(scan_id, timeout=1.5)
+        _terminate_scan_processes(scan_id, deadline=time.monotonic() + 0.5)
         status = 'partial' if findings else 'failed'
         return _attach_cleanup_info(build_module_result(MODULE, findings, {}, status=status,
                                     error=str(e), duration_seconds=time.monotonic() - start))
     finally:
-        cleanup_budget = min(3.0, max(0.5, _WEBSCAN_SOFT_LIMIT - (time.monotonic() - start)))
-        _terminate_scan_processes(scan_id, timeout=cleanup_budget)
+        _terminate_scan_processes(scan_id, deadline=time.monotonic() + 1.0)
         _cleanup_scan_lifecycle(scan_id)
 
 

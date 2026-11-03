@@ -109,6 +109,9 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   `_merge_url_params()` helper (concatenating instead of overriding a
   shared key) - fixed there too, for defense-in-depth independent of what
   a calling module hands it.
+- Webscan lifecycle hardening: Made process cleanup strictly deadline-aware by passing a single absolute monotonic deadline through discovery, SIGTERM, waiting, and SIGKILL escalation without minimum wait inflation, preventing scan budget violations.
+- Eviction and late-registration safety: Bounded task runners track active worker counts per scan (`_scan_worker_counts`). `_register_scan_process` strictly requires `ACTIVE` state and rejects unknown/evicted scans, immediately terminating late subprocesses. Active scans and terminated scans with running workers are protected from eviction.
+- Genuinely bounded worker termination: Injected cancellation checks into `_wait_for_zap`, `ZAPv2._request_api`, `_run_katana`, and `_run_nikto` so unblocked HTTP workers exit promptly without running additional scan phases or accumulating abandoned threads.
 - `tasks/owasp.py`'s authenticated-scan login (`_make_session`) had three
   compounding bugs, each found live against a different real external
   target: (1) it POSTed to the configured `login_url` unconditionally
