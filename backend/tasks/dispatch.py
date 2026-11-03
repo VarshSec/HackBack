@@ -96,10 +96,11 @@ def dispatch_scan(module: str, scan_id: str, domain: str, quick: bool = False) -
         from net_guard import assert_public_host
         assert_public_host(domain)
         if settings.SCANNER_BACKEND == 'modal':
-            return _run_modal(module, scan_id, domain, auth, quick)
-        if module == 'tech_fingerprint':
-            return _pure_fn(module)(scan_id, domain, auth, quick)
-        return _pure_fn(module)(scan_id, domain, auth)
+            envelope = _run_modal(module, scan_id, domain, auth, quick)
+        elif module == 'tech_fingerprint':
+            envelope = _pure_fn(module)(scan_id, domain, auth, quick)
+        else:
+            envelope = _pure_fn(module)(scan_id, domain, auth)
     except Exception as e:
         # A Modal timeout (container hit its function timeout) reports as
         # status='timeout' so the operator sees a timeout, not a generic
@@ -108,5 +109,23 @@ def dispatch_scan(module: str, scan_id: str, domain: str, quick: bool = False) -
         status = 'timeout' if is_timeout else 'failed'
         logger.error("dispatch: module %s %s for scan %s (backend=%s): %s",
                      module, status, scan_id, settings.SCANNER_BACKEND, e)
-        return build_module_result(module, [], {}, status=status,
-                                   error=f'{type(e).__name__}: {e}')
+        envelope = build_module_result(module, [], {}, status=status,
+                                       error=f'{type(e).__name__}: {e}')
+
+    try:
+        from tasks.base_task import persist_module_result, get_persisted_module_results
+        # If this execution failed/timed out with empty findings, but an earlier execution had findings, preserve them
+        if envelope.get('status') in ('failed', 'timeout') and not envelope.get('findings'):
+            persisted = get_persisted_module_results(scan_id).get(module)
+            if persisted and persisted.get('findings'):
+                envelope['findings'] = persisted['findings']
+                envelope['status'] = 'partial'
+                logger.info("dispatch: recovered %d previous findings for %s in scan %s",
+                            len(persisted['findings']), module, scan_id)
+
+        persist_module_result(scan_id, module, envelope)
+    except Exception as e:
+        logger.warning("dispatch: failed to persist module result for %s in scan %s: %s",
+                       module, scan_id, e)
+
+    return envelope

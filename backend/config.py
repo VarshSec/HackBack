@@ -34,6 +34,11 @@ class Settings(BaseSettings):
     # Confidence verification stage (analysis/verifier.py) - passive
     # re-observation of verifiable findings between aggregation and scoring.
     ENABLE_VERIFICATION: bool = True
+    # TLS certificate verification options:
+    # Optional path to a custom CA certificate bundle (e.g. for enterprise or lab targets)
+    CA_BUNDLE_PATH: str = ""
+    # Whether outbound HTTPS requests verify TLS certificates by default
+    VERIFY_SSL: bool = True
     # ZAP's session-data bind mount (same host dir the zap service writes to,
     # per docker-compose.yml's `zap`/`worker` volumes) - the worker needs this
     # to prune a scan's session files after its own PDF is generated (Section

@@ -12,7 +12,7 @@ from urllib.parse import urljoin, quote
 import psutil
 import requests
 from celery.exceptions import SoftTimeLimitExceeded
-from zapv2 import ZAPv2
+from zapv2 import ZAPv2 as _BaseZAPv2
 
 from config import settings
 from tasks.base_task import (
@@ -85,16 +85,45 @@ def _zap_port(scan_id: str) -> int:
     return 8090 + (hash(scan_id) % 900)
 
 
-def _kill_zap(proc: Optional[subprocess.Popen]) -> None:
-    """
-    Terminate the ZAP daemon and all its children: graceful SIGTERM first,
-    then SIGKILL after 5s, then reap the Popen so it can't become a zombie.
-    Never raises - called from finally blocks.
-    """
-    if proc is None:
+_ZAP_API_CONNECT_TIMEOUT = 5.0
+_ZAP_API_READ_TIMEOUT = 25.0
+
+
+class ZAPv2(_BaseZAPv2):
+    """ZAPv2 client enforcing bounded connection and read timeouts on all API requests."""
+
+    def _request_api(self, url, query=None, method="GET", body=None):
+        if not url.startswith('http://zap/'):
+            raise ValueError('A non ZAP API url was specified ' + url)
+        with requests.Session() as session:
+            apikey = getattr(self, '_ZAPv2__apikey', None)
+            if apikey is not None:
+                session.headers['X-ZAP-API-Key'] = apikey
+            proxies = getattr(self, '_ZAPv2__proxies', None)
+            response = session.request(
+                method, url, params=query, data=body,
+                proxies=proxies,
+                verify=False,
+                timeout=(_ZAP_API_CONNECT_TIMEOUT, _ZAP_API_READ_TIMEOUT),
+            )
+        validate_status = getattr(self, '_ZAPv2__validate_status_code', False)
+        if validate_status and 300 <= response.status_code < 500:
+            raise Exception(f"Non-successful status code returned from ZAP: {response.status_code} response: {response.text}")
+        elif validate_status and response.status_code >= 500:
+            raise Exception(f"Non-successful status code returned from ZAP: {response.status_code} response: {response.text}")
+        return response
+
+
+BoundedZAPv2 = ZAPv2
+
+
+def _kill_process_tree(proc_or_pid, timeout: float = 5.0) -> None:
+    """Terminate a process and all its descendants cleanly."""
+    if proc_or_pid is None:
         return
     try:
-        parent = psutil.Process(proc.pid)
+        pid = proc_or_pid.pid if hasattr(proc_or_pid, 'pid') else proc_or_pid
+        parent = psutil.Process(pid)
         children = parent.children(recursive=True)
         for child in children:
             try:
@@ -103,7 +132,7 @@ def _kill_zap(proc: Optional[subprocess.Popen]) -> None:
                 pass
         parent.terminate()
 
-        gone, alive = psutil.wait_procs([parent] + children, timeout=5)
+        gone, alive = psutil.wait_procs([parent] + children, timeout=timeout)
         for p in alive:
             try:
                 p.kill()
@@ -112,13 +141,22 @@ def _kill_zap(proc: Optional[subprocess.Popen]) -> None:
     except psutil.NoSuchProcess:
         pass
     except Exception as e:
-        logger.warning("ZAP kill warning (non-fatal): %s", e)
+        logger.warning("Process tree termination warning (non-fatal): %s", e)
     finally:
-        # Reap the subprocess handle so no zombie is left behind.
-        try:
-            proc.wait(timeout=3)
-        except Exception:
-            pass
+        if hasattr(proc_or_pid, 'wait'):
+            try:
+                proc_or_pid.wait(timeout=2)
+            except Exception:
+                pass
+
+
+def _kill_zap(proc: Optional[subprocess.Popen]) -> None:
+    """
+    Terminate the ZAP daemon and all its children: graceful SIGTERM first,
+    then SIGKILL after 5s, then reap the Popen so it can't become a zombie.
+    Never raises - called from finally blocks.
+    """
+    _kill_process_tree(proc, timeout=5.0)
 
 
 def _start_zap(scan_id: str, port: int) -> Optional[subprocess.Popen]:
@@ -555,14 +593,17 @@ def _run_katana(scan_id: str, domain: str, target_url: str) -> List[dict]:
     findings = []
     out_path = f'/tmp/katana_{scan_id}.txt'
     try:
-        subprocess.run(
-            ['katana', '-u', target_url,
-             '-jc', '-kf', 'all', '-d', '3', '-c', '10', '-rate-limit', '50',
-             '-timeout', '15', '-o', out_path, '-silent', '-no-color', '-json'],
-            timeout=_KATANA_TIMEOUT,
-            capture_output=True,
-            check=False,
-        )
+        try:
+            subprocess.run(
+                ['katana', '-u', target_url,
+                 '-jc', '-kf', 'all', '-d', '3', '-c', '10', '-rate-limit', '50',
+                 '-timeout', '15', '-o', out_path, '-silent', '-no-color', '-json'],
+                capture_output=True,
+                timeout=_KATANA_TIMEOUT,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            logger.warning("Katana timed out (%ds) for scan %s", _KATANA_TIMEOUT, scan_id)
 
         if not os.path.exists(out_path):
             return findings
@@ -593,8 +634,6 @@ def _run_katana(scan_id: str, domain: str, target_url: str) -> List[dict]:
             finding['endpoint'] = endpoint
             findings.append(finding)
 
-    except subprocess.TimeoutExpired:
-        logger.warning("Katana timed out (%ds) for scan %s", _KATANA_TIMEOUT, scan_id)
     except FileNotFoundError:
         logger.warning("Katana not installed - skipping for scan %s", scan_id)
     except Exception as e:
@@ -636,18 +675,21 @@ def _run_nikto(scan_id: str, domain: str, target_url: str) -> List[dict]:
     findings = []
     out_path = f'/tmp/nikto_{scan_id}.json'
     try:
-        subprocess.run(
-            [
-                'nikto', '-h', target_url,
-                '-Format', 'json',
-                '-o', out_path,
-                '-Tuning', '1234578b',
-                '-maxtime', '120s',
-            ],
-            timeout=_NIKTO_TIMEOUT,
-            capture_output=True,
-            check=False,
-        )
+        try:
+            subprocess.run(
+                [
+                    'nikto', '-h', target_url,
+                    '-Format', 'json',
+                    '-o', out_path,
+                    '-Tuning', '1234578b',
+                    '-maxtime', '120s',
+                ],
+                capture_output=True,
+                timeout=_NIKTO_TIMEOUT,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            logger.warning("Nikto timed out (%ds) for scan %s", _NIKTO_TIMEOUT, scan_id)
 
         if not os.path.exists(out_path):
             logger.warning("Nikto produced no output for scan %s", scan_id)
@@ -710,20 +752,11 @@ def _run_nikto(scan_id: str, domain: str, target_url: str) -> List[dict]:
                     **verify_kwargs,
                 ))
 
-    except subprocess.TimeoutExpired:
-        logger.warning("Nikto timed out for scan %s", scan_id)
     except FileNotFoundError:
         logger.warning("Nikto not installed - skipping for scan %s", scan_id)
     except json.JSONDecodeError as e:
         logger.error("Nikto JSON parse error for scan %s: %s", scan_id, e)
     except SoftTimeLimitExceeded:
-        # Unlike _run_zap/_run_katana (executed inside ThreadPoolExecutor
-        # worker threads, where Celery's signal-based soft-limit interrupt
-        # can never land - Python only delivers signals to the main thread),
-        # _run_nikto runs sequentially in the main thread after the pool
-        # block above, so it's the one place in this file that can actually
-        # receive this exception - swallowing it here would silently absorb
-        # the module's own graceful-timeout signal.
         raise
     except Exception as e:
         logger.error("Nikto error for scan %s: %s", scan_id, e)
@@ -760,24 +793,54 @@ def scan_webscan(scan_id: str, domain: str, auth: dict = None) -> dict:
     timing-budget note above). Katana runs in a thread ALONGSIDE ZAP so it
     adds no wall-clock time; Nikto still runs sequentially after both finish.
     Returns a build_module_result() envelope (Section 4.3 schema note).
-
-    A second, distinct case - ZAP going unreachable *after* scanning already
-    started (a mid-scan daemon restart) - is reported as 'partial' with a
-    descriptive error instead, the same pattern tech_fingerprint.py uses when
-    exactly one of whatweb/wafw00f fails. See `_run_zap`'s docstring for why
-    this distinction matters: silently reporting 'success' here previously
-    made a lost ZAP scan indistinguishable from "ZAP genuinely found nothing".
     """
+    import concurrent.futures
     start = time.monotonic()
     findings = []
     target_url = resolve_target_url(domain)
+    zap_findings = []
+    katana_findings = []
+    nikto_findings = []
+    zap_version = None
+    zap_disconnected = False
+    zap_timed_out = False
+    katana_timed_out = False
+    zap_failed = False
+    katana_failed = False
 
     try:
+        pool_budget = max(10, int(_WEBSCAN_SOFT_LIMIT - (time.monotonic() - start) - _NIKTO_TIMEOUT - 5))
         with ThreadPoolExecutor(max_workers=2) as executor:
             zap_future = executor.submit(_run_zap, scan_id, domain, target_url, auth)
             katana_future = executor.submit(_run_katana, scan_id, domain, target_url)
-            zap_findings, zap_version, zap_disconnected = zap_future.result()
-            katana_findings = katana_future.result()
+
+            done, not_done = concurrent.futures.wait(
+                [zap_future, katana_future],
+                timeout=pool_budget,
+                return_when=concurrent.futures.ALL_COMPLETED,
+            )
+
+            if zap_future in done:
+                try:
+                    zap_findings, zap_version, zap_disconnected = zap_future.result()
+                except Exception as e:
+                    logger.error("ZAP thread failed for scan %s: %s", scan_id, e)
+                    zap_failed = True
+            else:
+                logger.warning("ZAP thread exceeded budget (%ds) for scan %s", pool_budget, scan_id)
+                zap_timed_out = True
+                zap_future.cancel()
+
+            if katana_future in done:
+                try:
+                    katana_findings = katana_future.result()
+                except Exception as e:
+                    logger.error("Katana thread failed for scan %s: %s", scan_id, e)
+                    katana_failed = True
+            else:
+                logger.warning("Katana thread exceeded budget (%ds) for scan %s", pool_budget, scan_id)
+                katana_timed_out = True
+                katana_future.cancel()
 
         findings.extend(zap_findings)
         findings.extend(katana_findings)
@@ -785,33 +848,56 @@ def scan_webscan(scan_id: str, domain: str, auth: dict = None) -> dict:
         if hidden_finding:
             findings.append(hidden_finding)
 
-        findings.extend(_run_nikto(scan_id, domain, target_url))
+        remaining = _WEBSCAN_SOFT_LIMIT - (time.monotonic() - start)
+        if remaining > 15:
+            nikto_findings = _run_nikto(scan_id, domain, target_url)
+            findings.extend(nikto_findings)
+        else:
+            logger.warning("Skipping Nikto for scan %s - remaining budget %ds < 15s", scan_id, remaining)
 
         tool_versions = {
             'zap':    zap_version or 'unknown',
             'katana': get_tool_version('katana', '-version'),
             'nikto':  get_tool_version('nikto', '-Version'),
         }
+
+        if zap_timed_out or katana_timed_out:
+            status = 'partial' if findings else 'timeout'
+            return build_module_result(
+                MODULE, findings, tool_versions, status=status,
+                error='Webscan sub-scanner timed out within execution budget; '
+                      'partial findings preserved.',
+                duration_seconds=time.monotonic() - start)
+
         if zap_disconnected:
             return build_module_result(
                 MODULE, findings, tool_versions, status='partial',
-                error='ZAP became unreachable mid-scan (daemon restart or '
-                      'connection loss) - some or all ZAP alerts for this '
-                      'scan were not collected; Katana/Nikto findings above '
-                      'are unaffected.',
+                error='ZAP disconnected mid-scan (daemon restarted or became unreachable); '
+                      'alerts collected up to disconnect were preserved.',
                 duration_seconds=time.monotonic() - start)
+
+        if zap_failed or katana_failed:
+            status = 'partial' if findings else 'failed'
+            return build_module_result(
+                MODULE, findings, tool_versions, status=status,
+                error='Webscan sub-scanner failed mid-scan; '
+                      'partial findings preserved.',
+                duration_seconds=time.monotonic() - start)
+
         return build_module_result(MODULE, findings, tool_versions, status='success',
                                     duration_seconds=time.monotonic() - start)
     except SoftTimeLimitExceeded:
         logger.warning("webscan hit its soft time limit (%ds) for scan %s",
                         _WEBSCAN_SOFT_LIMIT, scan_id)
+        status = 'partial' if findings else 'timeout'
         return build_module_result(
-            MODULE, findings, {}, status='timeout',
+            MODULE, findings, {}, status=status,
             error=f'Module exceeded its soft time limit ({_WEBSCAN_SOFT_LIMIT}s)',
             duration_seconds=time.monotonic() - start)
     except Exception as e:
         logger.exception("webscan unexpected error scan=%s: %s", scan_id, e)
-        return build_module_result(MODULE, findings, {}, status='failed',
+        status = 'partial' if findings else 'failed'
+        return build_module_result(MODULE, findings, {}, status=status,
                                     error=str(e), duration_seconds=time.monotonic() - start)
 
 

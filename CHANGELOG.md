@@ -4,7 +4,19 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## Unreleased
 
+### Added
+- **TLS Certificate Verification Controls (`backend/config.py`, `backend/net_guard.py`):**
+  Added `VERIFY_SSL` (default: `True`) and `CA_BUNDLE_PATH` (default: `""`) settings to support lab environments and custom CA bundles while enforcing strict certificate verification by default.
+- **Durable Module Results (`backend/tasks/base_task.py`, `backend/tasks/dispatch.py`, `backend/tasks/scan_orchestrator.py`):**
+  Added atomic interim module result persistence (`persist_module_result` and `get_persisted_module_results`) using PostgreSQL `jsonb_set` so module findings survive worker restarts and Celery chord failures. Added result reconciliation (`_reconcile_module_results`) during chord callbacks and user-decision resumes.
+- **SSRF Hardening & NAT64 Support (`backend/net_guard.py`, `backend/schemas.py`):**
+  Added IPv4-mapped IPv6 and NAT64 (`64:ff9b::/96`) address unwrapping to both network guards and domain schemas to prevent SSRF bypasses via embedded private IP ranges.
+
 ### Fixed
+- **TLS Insecurity & Silent Bypasses (`backend/tasks/owasp.py`, `backend/tasks/auth_login.py`, `backend/analysis/verifier.py`):**
+  Removed globally disabled certificate verification (`verify=False`) and blanket urllib3 warning suppressions. Outbound scanner sessions, token login endpoints, and Playwright verification browser contexts now strictly verify TLS certificates by default. Differentiated `requests.exceptions.SSLError` from connection failures, prevented insecure silent fallback, and ensured credentials and tokens are redacted from error logs.
+- **Webscan Timeouts and Resource Cleanup (`backend/tasks/webscan.py`):**
+  Wrapped ZAP API calls in `BoundedZAPv2` enforcing connection (5.0s) and read (25.0s) timeouts. Bounded `ThreadPoolExecutor` wait with execution budget tracking. Replaced unbounded subprocess operations with bounded `subprocess.run(timeout=...)` for Katana and Nikto. Added process-tree cleanup (`_kill_process_tree`) and `SoftTimeLimitExceeded` handling to ensure partial findings are preserved when a scanner times out or disconnects.
 - Remediation text in the PDF/dashboard could be vague and non-actionable
   for several finding types (e.g. "Review and secure all paths..." with no
   concrete step) - fine for a security specialist, not enough for a

@@ -2,8 +2,10 @@ import logging
 import os
 import re
 from datetime import datetime, timezone
-
-import weasyprint
+try:
+    import weasyprint
+except (ImportError, OSError):
+    weasyprint = None
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 logger = logging.getLogger(__name__)
@@ -139,6 +141,8 @@ def generate_pdf(scan, analysis: dict, store_in_db: bool = True) -> bytes:
     html = template.render(**context)
 
     # --- PDF generation ---
+    if weasyprint is None:
+        raise RuntimeError("WeasyPrint is not available (native libraries like libgobject missing)")
     pdf_bytes = weasyprint.HTML(string=html).write_pdf()
     logger.info("PDF generated for scan %s (%d bytes)", scan.id, len(pdf_bytes))
 

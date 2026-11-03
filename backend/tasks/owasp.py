@@ -16,8 +16,6 @@ from tasks.base_task import (
 )
 from tasks.celery_app import app
 
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
 logger = logging.getLogger(__name__)
 MODULE = 'owasp'
 
@@ -29,7 +27,7 @@ MODULE = 'owasp'
 # WAF throttles (429/503) is unchanged (mount_retry_adapter, status-code based,
 # not triggered by a plain timeout).
 _TIMEOUT = scaled_timeout(10)
-_SESSION_KWARGS = dict(timeout=_TIMEOUT, verify=False, allow_redirects=False)
+_SESSION_KWARGS = dict(timeout=_TIMEOUT, allow_redirects=False)
 
 # SQL error patterns that indicate injection vulnerability
 _SQL_ERRORS = [
@@ -276,6 +274,8 @@ def _make_session(auth: Optional[dict]) -> requests.Session:
     behind login" apart from "0 findings, and also the login never worked."
     """
     session = requests.Session()
+    from config import settings
+    session.verify = settings.CA_BUNDLE_PATH if getattr(settings, 'CA_BUNDLE_PATH', None) else getattr(settings, 'VERIFY_SSL', True)
     session.login_result = {'attempted': False, 'outcome': None, 'detail': None}
     # GET-only retry/backoff on 429/502/503/504 - a real WAF throttling mid-scan
     # would otherwise silently read as "clean" on whatever page it hit next,
@@ -397,6 +397,9 @@ def _make_session(auth: Optional[dict]) -> requests.Session:
                            'guess: the post-login response no longer shows a login form, '
                            'which is consistent with (but does not confirm) success. '
                            'Set logged_in_indicator for a reliable check.')
+    except requests.exceptions.SSLError as e:
+        logger.warning("owasp login TLS certificate verification failed for %s: %s", auth.get('login_url'), e)
+        session.login_result.update(outcome='error', detail=f'TLS certificate verification failed: {e}')
     except requests.RequestException as e:
         logger.warning("owasp login POST to %s failed (continuing "
                         "unauthenticated): %s", auth.get('login_url'), e)
@@ -445,6 +448,9 @@ def _discover_urls(session: requests.Session, target: str, domain: str) -> List[
             parser.feed(resp.text)
         except SoftTimeLimitExceeded:
             raise
+        except requests.exceptions.SSLError as e:
+            logger.warning("crawl fetch TLS certificate verification failed for %s: %s", url, e)
+            continue
         except Exception as e:
             logger.debug("crawl fetch failed for %s: %s", url, e)
             continue
@@ -961,6 +967,9 @@ def scan_owasp(scan_id: str, domain: str, auth: dict = None) -> dict:
                     findings.extend(test_fn(session, url, domain))
                 except SoftTimeLimitExceeded:
                     raise
+                except requests.exceptions.SSLError as e:
+                    logger.warning("owasp %s TLS certificate verification error for scan %s (url=%s): %s",
+                                   test_fn.__name__, scan_id, url, e)
                 except Exception as e:
                     logger.error("owasp %s failed for scan %s (url=%s): %s",
                                  test_fn.__name__, scan_id, url, e)

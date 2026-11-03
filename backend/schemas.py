@@ -83,13 +83,14 @@ def normalize_domain(v: str) -> str:
     if host == "localhost" or host.endswith(".localhost"):
         raise ValueError("Scanning localhost is not permitted")
 
-    # Reject private / loopback / link-local IP literals (RFC 1918 etc.)
+    # Reject private / loopback / link-local IP literals (RFC 1918, NAT64, IPv4-mapped, etc.)
     try:
         ip = ipaddress.ip_address(host)
     except ValueError:
         ip = None
     if ip is not None:
-        if ip.is_private or ip.is_loopback or ip.is_link_local:
+        from net_guard import _ip_is_disallowed
+        if _ip_is_disallowed(str(ip)):
             raise ValueError("Scanning private/internal IP addresses is not permitted")
         # Public IP literal - allow it through.
         return host

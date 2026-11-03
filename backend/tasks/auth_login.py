@@ -24,7 +24,6 @@ import requests
 import urllib3
 import net_guard
 
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 logger = logging.getLogger(__name__)
 
 _TIMEOUT = 30
@@ -49,6 +48,10 @@ def detect_login_type(login_url: str) -> str:
     """
     try:
         resp = net_guard.guarded_get(login_url, timeout=_TIMEOUT, allow_redirects=True)
+    except requests.exceptions.SSLError as e:
+        logger.warning("login-type auto-detect GET %s failed due to TLS certificate verification error: %s",
+                       login_url, e)
+        return 'form'
     except Exception as e:
         logger.warning("login-type auto-detect GET %s failed, defaulting to "
                         "'form': %s", login_url, e)
@@ -141,6 +144,9 @@ def fetch_json_auth_token(auth: dict) -> Optional[str]:
         resp = net_guard.guarded_request('post', login_url, json=body, timeout=_TIMEOUT)
         resp.raise_for_status()
         data = resp.json()
+    except requests.exceptions.SSLError as e:
+        logger.warning("JSON login POST to %s failed due to TLS certificate verification error: %s", login_url, e)
+        return None
     except Exception as e:
         logger.warning("JSON login POST to %s failed: %s", login_url, e)
         return None

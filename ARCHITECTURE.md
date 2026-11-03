@@ -502,9 +502,7 @@ prior written authorization.
   always run inside Celery tasks with timeouts.
 - Letting the ZAP daemon linger - kill it in a `finally:` block, not just
   the happy path.
-- Using `verify=True` for HTTPS requests against test targets with
-  self-signed certs - use `verify=False` + `urllib3.disable_warnings()` as
-  a scanner-design choice, not a security one.
+- Disabling TLS verification or using `verify=False` globally — always use strict TLS verification (`VERIFY_SSL=True`); for lab targets with internal/self-signed certs, supply `CA_BUNDLE_PATH` pointing to the trusted CA bundle instead of disabling certificate validation.
 - Omitting `found_by` from module output - breaks the aggregator's dedup
   silently.
 - Storing PDF bytes in `scans.ai_analysis` JSONB - PDF data goes in
@@ -521,6 +519,33 @@ prior written authorization.
   `confidence='unverified'` with a `verification_note` instead.
 - Calling `compute_risk_score()` with a severity-counts dict - it takes the
   scored findings list, since confidence isn't visible at the counts level.
+
+---
+
+## Reliability, Durability & Target Safety (Phase 1)
+
+### 1. Strict TLS Verification & CA Bundle Support
+Outbound HTTP scanners (`owasp.py`), authentication clients (`auth_login.py`), network guards (`net_guard.py`), and verification contexts (`verifier.py`) enforce TLS certificate verification by default.
+- Verification setting: Controlled by `settings.VERIFY_SSL` (default: `True`) and `settings.CA_BUNDLE_PATH` (default: `""`).
+- Error separation: `requests.exceptions.SSLError` is intercepted explicitly and reported cleanly without leaking credentials or tokens, distinguishing cryptographic handshake failures from network unreachability.
+- No silent fallback: Scanners never downgrade to unverified connections silently.
+
+### 2. Web Scan Timeouts & Process Cleanup
+- `BoundedZAPv2`: Wraps ZAP API interactions with strict connect (5.0s) and read (25.0s) timeouts to prevent hangs on daemon disconnects.
+- `ThreadPoolExecutor`: Bounded by execution budget. If a scanner thread stalls, the executor does not block scan progression indefinitely.
+- Process tree termination: External subprocesses (Katana, Nikto) enforce timeouts with automatic process killing, and temporary artifact paths are cleanly unlinked in `finally` blocks.
+- `SoftTimeLimitExceeded`: Handled gracefully to preserve all partial findings gathered up to the timeout.
+
+### 3. Durable Module Results & Failure Recovery
+- Interim persistence: Every scanner module persists its envelope atomically to PostgreSQL (`scans.raw_findings['interim_results'][module]`) upon completion.
+- Celery chord resilience: When worker restarts, OOMs, or chord failures occur, `_reconcile_module_results` queries PostgreSQL to recover completed module outputs before initiating downstream aggregation.
+- Differentiating empty results from failures: Module results accurately track status (`success`, `partial`, `timeout`, `failed`), ensuring empty legitimate scans are not confused with missing or crashed executions.
+
+### 4. Target Resolution & SSRF Protection
+- IP Disallowance: Private (RFC 1918), loopback (127.0.0.0/8, ::1), link-local (169.254.0.0/16, fe80::/10), and cloud metadata endpoints are blocked.
+- IPv6 Transition Mapping: IPv4-mapped IPv6 (`::ffff:0:0/96`) and NAT64 (`64:ff9b::/96`) prefixes are unwrapped to their underlying IPv4 addresses and validated against internal ranges.
+- DNS Rebinding Defense: `_PinnedPoolAdapter` resolves target IP once, validates it, and forces connections directly to the pinned IP with the original SNI hostname.
+- Redirect Re-validation: HTTP redirect targets are re-checked against SSRF disallowance rules before following.
 
 ---
 

@@ -14,7 +14,7 @@ the one place that turns "a host string" into "a safe connection":
     connection (defeats rebinding), and re-validate every redirect hop. This is
     what the requests-based modules use instead of raw requests.get.
 
-ponytail: subprocess tools (nmap, whatweb, nuclei, ffuf, testssl...) do their
+Note: subprocess tools (nmap, whatweb, nuclei, ffuf, testssl...) do their
 own DNS at connect time, so they get the dispatch-time assert_public_host gate,
 not per-connection pinning - closing that fully means teaching each tool to
 target-by-IP-with-Host, which is a much larger change. The pin is applied to
@@ -28,6 +28,7 @@ can't route - they return a generic 403/edge page stripped of the real site's
 headers, producing false "missing header"/wrong-status findings on most of the
 HTTPS web. Same approach ssl_tls.py and routers/verify.py already use.
 """
+
 import ipaddress
 import socket
 from urllib.parse import urlsplit
@@ -35,6 +36,7 @@ from urllib.parse import urlsplit
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3 import HTTPConnectionPool, HTTPSConnectionPool
+
 
 # Networks ipaddress' category flags don't all cover: CGNAT, IETF protocol
 # assignments, benchmarking. is_private/is_loopback/is_link_local/is_reserved/
@@ -44,6 +46,10 @@ _EXTRA_BLOCKED = [
     ipaddress.ip_network("192.0.0.0/24"),    # IETF protocol assignments
     ipaddress.ip_network("198.18.0.0/15"),   # benchmarking (RFC 2544)
 ]
+
+# RFC 6052 Well-Known NAT64 Prefix (/96).
+# Decode the embedded IPv4 address before applying the existing SSRF checks.
+_NAT64_PREFIX = ipaddress.ip_network("64:ff9b::/96")
 
 _REDIRECT_CODES = {301, 302, 303, 307, 308}
 _MAX_REDIRECTS = 5
@@ -64,12 +70,23 @@ class SsrfBlocked(ValueError):
 
 def _ip_is_disallowed(ip_str: str) -> bool:
     ip = ipaddress.ip_address(ip_str)
+
     # Unwrap IPv4-mapped IPv6 (::ffff:10.0.0.1 must be judged as 10.0.0.1).
     if ip.version == 6 and ip.ipv4_mapped is not None:
         ip = ip.ipv4_mapped
+
+    # Unwrap the RFC 6052 well-known NAT64 prefix (64:ff9b::/96).
+    # The embedded IPv4 is then evaluated by the SAME rules as ordinary IPv4.
+    elif ip.version == 6 and ip in _NAT64_PREFIX:
+        ip = ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
+
     return (
-        ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved
-        or ip.is_multicast or ip.is_unspecified
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_reserved
+        or ip.is_multicast
+        or ip.is_unspecified
         or any(ip in net for net in _EXTRA_BLOCKED)
     )
 
@@ -89,12 +106,16 @@ def resolve_public_ips(host: str) -> list[str]:
         infos = socket.getaddrinfo(host, None)
     except socket.gaierror as e:
         raise SsrfBlocked(f"{host} does not resolve ({e})")
+
     ips = sorted({info[4][0] for info in infos}, key=_pin_sort_key)
     if not ips:
         raise SsrfBlocked(f"{host} does not resolve")
+
     bad = [ip for ip in ips if _ip_is_disallowed(ip)]
     if bad:
-        raise SsrfBlocked(f"{host} resolves to non-public address(es): {', '.join(bad)}")
+        raise SsrfBlocked(
+            f"{host} resolves to non-public address(es): {', '.join(bad)}"
+        )
     return ips
 
 
@@ -127,57 +148,111 @@ class _PinnedPoolAdapter(HTTPAdapter):
         return super().send(request, **kwargs)
 
     def get_connection(self, url, proxies=None):
+        return self.get_connection_with_tls_context(url, verify=None, proxies=proxies)
+
+    def get_connection_with_tls_context(
+        self, request_or_url, verify, proxies=None, cert=None
+    ):
+        url = request_or_url.url if hasattr(request_or_url, "url") else request_or_url
         parsed = urlsplit(url)
         host, scheme = parsed.hostname, parsed.scheme
         if not host:
             raise SsrfBlocked(f"no host in URL: {url!r}")
         port = parsed.port or (443 if scheme == "https" else 80)
-        key = (scheme, host, port)
+
+        # Resolve effective verify: None defaults to settings
+        if verify is None:
+            from config import settings
+            if getattr(settings, "CA_BUNDLE_PATH", None):
+                verify = settings.CA_BUNDLE_PATH
+            else:
+                verify = getattr(settings, "VERIFY_SSL", True)
+
+        key = (scheme, host, port, verify)
         pool = self._pools.get(key)
         if pool is None:
-            ip = resolve_public_ips(host)[0]             # validate + pin; raises if non-public
+            ip = resolve_public_ips(host)[0]  # validate + pin; raises if non-public
             if scheme == "https":
                 # server_hostname keeps SNI = the real name; connect goes to ip.
-                # cert_reqs NONE mirrors the scanner-wide verify=False stance.
-                pool = HTTPSConnectionPool(ip, port=port, server_hostname=host,
-                                           assert_hostname=False, cert_reqs="CERT_NONE",
-                                           retries=False)
+                if verify:
+                    cert_reqs = "CERT_REQUIRED"
+                    assert_hostname = host
+                    if isinstance(verify, str) and verify:
+                        ca_certs = verify
+                    else:
+                        from config import settings
+                        ca_certs = settings.CA_BUNDLE_PATH if getattr(settings, "CA_BUNDLE_PATH", None) else None
+                else:
+                    cert_reqs = "CERT_NONE"
+                    assert_hostname = False
+                    ca_certs = None
+
+                pool = HTTPSConnectionPool(
+                    ip,
+                    port=port,
+                    server_hostname=host,
+                    assert_hostname=assert_hostname,
+                    cert_reqs=cert_reqs,
+                    ca_certs=ca_certs,
+                    retries=False,
+                )
             else:
                 pool = HTTPConnectionPool(ip, port=port, retries=False)
             self._pools[key] = pool
         return pool
 
-    # requests 2.31 calls the 2-arg get_connection above. Keep the newer name a
-    # thin alias so a requests bump to 2.32+ doesn't silently bypass the pin.
-    def get_connection_with_tls_context(self, request, verify, proxies=None, cert=None):
-        return self.get_connection(request.url, proxies)
-
     def close(self):
-        for p in self._pools.values():
+        for pool in self._pools.values():
             try:
-                p.close()
+                pool.close()
             except Exception:
                 pass
         self._pools.clear()
         super().close()
 
 
-def guarded_request(method: str, url: str, *, session: requests.Session | None = None,
-                    follow: bool | None = None, max_redirects: int = _MAX_REDIRECTS,
-                    **kwargs) -> requests.Response:
+def get_tls_verify() -> bool | str:
+    """Return the default TLS verification setting or custom CA bundle path."""
+    from config import settings
+    if getattr(settings, "CA_BUNDLE_PATH", None):
+        return settings.CA_BUNDLE_PATH
+    return getattr(settings, "VERIFY_SSL", True)
+
+
+def guarded_request(
+    method: str,
+    url: str,
+    *,
+    session: requests.Session | None = None,
+    follow: bool | None = None,
+    max_redirects: int = _MAX_REDIRECTS,
+    verify: bool | str | None = None,
+    **kwargs,
+) -> requests.Response:
     """Drop-in for requests.<method> that pins every connection (including each
     redirect hop) to the host's validated public IP while keeping the hostname
-    for SNI/cert/Host (see _PinnedPoolAdapter). `verify=False` is forced - the
-    scanner talks to hostile hosts, cert trust is not the point. `follow` defaults
-    to the caller's `allow_redirects` (True if unset, matching requests), so call
-    sites are drop-in: `allow_redirects=False` (owasp's open-redirect / injection
-    probes) => a single unfollowed response to inspect; redirects that ARE
-    followed route back through the pinning adapter, so a 302 into a private
-    range raises SsrfBlocked mid-chain."""
+    for SNI/cert/Host (see _PinnedPoolAdapter).
+    
+    TLS certificate verification is enabled by default (VERIFY_SSL=True) or
+    configured via CA_BUNDLE_PATH for trusted lab certificates. To explicitly
+    scan targets with self-signed or invalid certificates, pass verify=False.
+    TLS certificate errors are raised as requests.exceptions.SSLError without
+    silent insecure fallback. `follow` defaults to the caller's `allow_redirects`
+    (True if unset, matching requests)."""
     if follow is None:
         follow = kwargs.get("allow_redirects", True)
-    kwargs["verify"] = False
     kwargs["allow_redirects"] = follow
+
+    if verify is None:
+        if "verify" in kwargs:
+            verify = kwargs.pop("verify")
+        else:
+            from config import settings
+            if getattr(settings, "CA_BUNDLE_PATH", None):
+                verify = settings.CA_BUNDLE_PATH
+            else:
+                verify = getattr(settings, "VERIFY_SSL", True)
+    kwargs["verify"] = verify
 
     own = session is None
     sess = session or requests.Session()
@@ -200,24 +275,57 @@ def guarded_get(url: str, **kwargs) -> requests.Response:
 
 def _demo() -> None:
     """Self-check: run `python -m net_guard`. No network needed for the IP logic."""
-    bad = ["127.0.0.1", "10.0.0.5", "169.254.169.254", "192.168.1.1", "::1",
-           "fe80::1", "100.64.0.1", "0.0.0.0", "::ffff:10.0.0.1", "224.0.0.1"]
-    good = ["8.8.8.8", "1.1.1.1", "93.184.216.34", "2606:2800:220:1:248:1893:25c8:1946"]
+    bad = [
+        "127.0.0.1",
+        "10.0.0.5",
+        "169.254.169.254",
+        "192.168.1.1",
+        "::1",
+        "fe80::1",
+        "100.64.0.1",
+        "0.0.0.0",
+        "::ffff:10.0.0.1",
+        "224.0.0.1",
+        # NAT64-encoded private / metadata / loopback IPv4 addresses.
+        "64:ff9b::a00:5",       # 10.0.0.5
+        "64:ff9b::a9fe:a9fe",   # 169.254.169.254
+        "64:ff9b::7f00:1",      # 127.0.0.1
+    ]
+    good = [
+        "8.8.8.8",
+        "1.1.1.1",
+        "93.184.216.34",
+        "2606:2800:220:1:248:1893:25c8:1946",
+        # NAT64-encoded public IPv4 addresses.
+        "64:ff9b::1739:4a10",   # 23.57.74.16
+        "64:ff9b::1739:4a02",   # 23.57.74.2
+        "64:ff9b::1740:1e0",    # 23.64.1.224
+        "64:ff9b::1740:1e2",    # 23.64.1.226
+    ]
+
     for ip in bad:
         assert _ip_is_disallowed(ip), f"should block {ip}"
     for ip in good:
         assert not _ip_is_disallowed(ip), f"should allow {ip}"
-    # literal path of resolve_public_ips
+
+    # Literal path of resolve_public_ips.
     for ip in bad:
         try:
-            resolve_public_ips(ip); assert False, f"resolve should reject {ip}"
+            resolve_public_ips(ip)
+            raise AssertionError(f"resolve should reject {ip}")
         except SsrfBlocked:
             pass
-    assert resolve_public_ips("8.8.8.8") == ["8.8.8.8"]
-    # IPv4-preference: the pin (caller takes [0]) must pick IPv4 over IPv6,
-    # which a plain string sort gets wrong ("2606:..." < "93...").
-    mixed = sorted({"2606:2800:220:1::1", "93.184.216.34", "1.1.1.1"}, key=_pin_sort_key)
+
+    for ip in good:
+        assert resolve_public_ips(ip) == [str(ipaddress.ip_address(ip))]
+
+    # IPv4-preference: the pin (caller takes [0]) must pick IPv4 over IPv6.
+    mixed = sorted(
+        {"2606:2800:220:1::1", "93.184.216.34", "1.1.1.1"},
+        key=_pin_sort_key,
+    )
     assert mixed[0] == "1.1.1.1", f"IPv4 must pin first, got {mixed}"
+
     print("net_guard self-check OK")
 
 

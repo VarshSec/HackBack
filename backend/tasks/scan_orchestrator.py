@@ -155,11 +155,64 @@ _AGGREGATE_SOFT_LIMIT = scaled_timeout(440)
 _AGGREGATE_HARD_LIMIT = scaled_timeout(500)
 
 
+def _reconcile_module_results(results: list, scan_id: str) -> list:
+    """
+    Reconcile module results from Celery chord with durably persisted results in PostgreSQL.
+    Guarantees that completed module results survive worker failures/timeouts in other modules,
+    recovers partial results, and distinguishes missing module results from legitimate
+    zero-finding successful modules.
+    """
+    from tasks.base_task import get_persisted_module_results, build_module_result, module_ids_for_mode
+    from database import SessionLocal
+    from models import Scan
+
+    db = SessionLocal()
+    mode = 'full'
+    try:
+        scan = db.query(Scan).filter(Scan.id == scan_id).first()
+        if scan and scan.scan_type:
+            mode = scan.scan_type
+    except Exception:
+        pass
+    finally:
+        db.close()
+
+    expected = module_ids_for_mode(mode)
+    persisted = get_persisted_module_results(scan_id)
+
+    by_module = {}
+    for m, env in persisted.items():
+        if isinstance(env, dict) and 'module' in env:
+            by_module[m] = env
+
+    if isinstance(results, list):
+        for r in results:
+            if isinstance(r, dict) and 'module' in r:
+                m = r['module']
+                if m not in by_module or r.get('status') in ('success', 'partial') or not by_module[m].get('findings'):
+                    by_module[m] = r
+
+    reconciled = []
+    for m in expected:
+        if m in by_module:
+            reconciled.append(by_module[m])
+        else:
+            reconciled.append(build_module_result(
+                module=m,
+                findings=[],
+                tool_versions={},
+                status='failed',
+                error='Module result missing from worker execution (interrupted or crashed)',
+            ))
+
+    return reconciled
+
+
 @app.task(name='tasks.scan_orchestrator.aggregate_and_analyse',
           soft_time_limit=_AGGREGATE_SOFT_LIMIT, time_limit=_AGGREGATE_HARD_LIMIT)
 def aggregate_and_analyse(results: list, scan_id: str, domain: str) -> None:
     """
-    Chord callback: called once all 8 scanning subtasks complete.
+    Chord callback: called once all scanning subtasks complete.
     results is a list of per-module result envelopes (base_task.py's
     build_module_result()): [{module, status, findings, tool_versions,
     finding_count, duration_seconds, error}, ...] - one per module,
@@ -170,7 +223,8 @@ def aggregate_and_analyse(results: list, scan_id: str, domain: str) -> None:
     see _pause_for_decision. 'partial' is not a pause trigger: it already
     carries usable data (Section 4.3), so it's treated like success here.
     """
-    logger.info("aggregate_and_analyse: scan %s received %d module results", scan_id, len(results))
+    results = _reconcile_module_results(results, scan_id)
+    logger.info("aggregate_and_analyse: scan %s received %d reconciled module results", scan_id, len(results))
 
     if _failed_modules(results):
         _pause_for_decision(results, scan_id, retry_counts={})
@@ -231,6 +285,7 @@ def continue_after_decision(scan_id: str, domain: str) -> None:
     finally:
         db.close()
 
+    results = _reconcile_module_results(results, scan_id)
     _finalize(results, scan_id, domain)
 
 
@@ -343,6 +398,7 @@ def _merge_retry_results(retry_results: list, scan_id: str, domain: str,
     """
     by_module = {r.get('module'): r for r in retry_results if isinstance(r, dict)}
     merged = [by_module.get(r.get('module'), r) for r in previous_results]
+    merged = _reconcile_module_results(merged, scan_id)
 
     if _failed_modules(merged):
         from database import SessionLocal
@@ -388,6 +444,10 @@ def _finalize(results: list, scan_id: str, domain: str) -> None:
         try:
             from analysis.aggregator import aggregate
             aggregated = aggregate(results)
+            from tasks.base_task import get_persisted_module_results
+            persisted = get_persisted_module_results(scan_id)
+            if persisted:
+                aggregated['interim_results'] = persisted
             scan.raw_findings = aggregated
             db.commit()
         except Exception as e:

@@ -243,6 +243,69 @@ def update_module_status(scan_id: str, module_name: str, status: str) -> None:
         db.close()
 
 
+def persist_module_result(scan_id: str, module_name: str, envelope: dict) -> None:
+    """
+    Persist completed module result envelope atomically into scans.raw_findings['interim_results'][module_name]
+    so that results are durably stored in PostgreSQL immediately upon module completion.
+    This guarantees that if another module crashes or times out, or if the worker restarts,
+    completed results are never lost.
+    """
+    import json
+    from database import SessionLocal
+    from sqlalchemy import text
+
+    db = SessionLocal()
+    try:
+        db.execute(
+            text(
+                "UPDATE scans SET raw_findings = jsonb_set("
+                "jsonb_set(coalesce(raw_findings, '{}'::jsonb), '{interim_results}', coalesce(raw_findings->'interim_results', '{}'::jsonb), true), "
+                "ARRAY['interim_results', CAST(:module_name AS text)], "
+                "CAST(:envelope_json AS jsonb), "
+                "true) "
+                "WHERE id = :scan_id"
+            ),
+            {
+                "module_name": module_name,
+                "envelope_json": json.dumps(envelope),
+                "scan_id": scan_id,
+            },
+        )
+        db.commit()
+    except Exception as e:
+        logger.error("persist_module_result failed scan=%s module=%s: %s", scan_id, module_name, e)
+    finally:
+        db.close()
+
+
+def get_persisted_module_results(scan_id: str) -> dict:
+    """
+    Retrieve durably stored interim module results from PostgreSQL.
+    Returns a dict mapping module_name -> envelope.
+    """
+    from database import SessionLocal
+    from models import Scan
+
+    db = SessionLocal()
+    try:
+        scan = db.query(Scan).filter(Scan.id == scan_id).first()
+        if not scan or not scan.raw_findings:
+            return {}
+        if isinstance(scan.raw_findings, dict):
+            interim = scan.raw_findings.get('interim_results')
+            if isinstance(interim, dict):
+                return interim
+            module_results = scan.raw_findings.get('module_results')
+            if isinstance(module_results, list):
+                return {r['module']: r for r in module_results if isinstance(r, dict) and 'module' in r}
+        return {}
+    except Exception as e:
+        logger.error("get_persisted_module_results failed scan=%s: %s", scan_id, e)
+        return {}
+    finally:
+        db.close()
+
+
 def normalize_finding(
     module: str,
     tool: str,

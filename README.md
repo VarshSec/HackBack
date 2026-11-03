@@ -210,6 +210,8 @@ Env vars, set via `.env` (copied from `.env.example`):
 | `SCAN_TIMEOUT_MULTIPLIER` | `1.5` | Scales every module's tool/Celery timeout - real-world targets are slower than lab targets; drop to `1.0` for lab-tuned timings |
 | `MAX_CONCURRENT_SCANS` | `3` | Concurrent-scan cap (resource-exhaustion / target-politeness guard, also sizes the DB connection pool) |
 | `HACKBACK_ENV` | `development` | `development` (self-hosted localhost — weak secrets only warn) or `production` (weak `SECRET_KEY`/Postgres password become a hard boot failure) |
+| `VERIFY_SSL` | `true` | Enforces TLS certificate verification by default across all outbound HTTP scanners and verifiers |
+| `CA_BUNDLE_PATH` | `""` | Optional path to custom CA certificate bundle for lab or internal environments |
 
 **The `POSTGRES_PASSWORD`/`SECRET_KEY` defaults above are demo-only** -
 they're fine for a local/personal instance but change both before deploying

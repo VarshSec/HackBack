@@ -36,9 +36,14 @@ from playwright.sync_api import sync_playwright
 from config import settings
 from tasks.base_task import mount_retry_adapter
 
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
 logger = logging.getLogger(__name__)
+
+def _get_verify_setting(session: Optional[requests.Session] = None):
+    if session is not None and getattr(session, 'verify', None) is not None:
+        return session.verify
+    if getattr(settings, 'CA_BUNDLE_PATH', None):
+        return settings.CA_BUNDLE_PATH
+    return getattr(settings, 'VERIFY_SSL', True)
 
 _TIMEOUT = round(15 * settings.SCAN_TIMEOUT_MULTIPLIER)
 
@@ -112,6 +117,7 @@ _SQLI_TIME_TOLERANCE = 0.5
 # makes (requests' default headers merged into a Playwright context that
 # otherwise uses its own defaults) even for an unauthenticated scan.
 _DEFAULT_CLIENT = mount_retry_adapter(requests.Session())
+_DEFAULT_CLIENT.verify = _get_verify_setting()
 
 
 def _demote(finding: dict, note: str) -> dict:
@@ -138,11 +144,13 @@ def verify_open_redirect(finding: dict, session: Optional[requests.Session] = No
         return _demote(finding, 'Verification skipped - missing verification_target data.')
     try:
         resp = client.get(_merge_url_params(url, {param: payload}), timeout=_TIMEOUT,
-                           verify=False, allow_redirects=False)
+                           verify=_get_verify_setting(session), allow_redirects=False)
         if resp.status_code in (301, 302, 303, 307, 308) and payload in resp.headers.get('Location', ''):
             return _promote(finding, f'Re-issued request confirmed a redirect to {payload!r} via the Location header.')
         return _demote(finding, 'Re-issued request did not reproduce the redirect - target may be patched, '
                                  'or the response has changed since the original scan.')
+    except requests.exceptions.SSLError as e:
+        return _demote(finding, f'Verification request failed due to TLS certificate error: {e}')
     except requests.RequestException as e:
         return _demote(finding, f'Verification request failed: {e}')
 
@@ -157,14 +165,16 @@ def verify_path_traversal(finding: dict, session: Optional[requests.Session] = N
     try:
         if param:
             resp = client.get(_merge_url_params(url, {param: payload}), timeout=_TIMEOUT,
-                               verify=False, allow_redirects=False)
+                               verify=_get_verify_setting(session), allow_redirects=False)
         else:
-            resp = client.get(url, timeout=_TIMEOUT, verify=False, allow_redirects=False)
+            resp = client.get(url, timeout=_TIMEOUT, verify=_get_verify_setting(session), allow_redirects=False)
         if any(s in resp.text for s in _TRAVERSAL_SENTINELS):
             return _promote(finding, 'Re-issued request reproduced known-safe sentinel content '
                                       '(e.g. /etc/passwd markers) in the response body.')
         return _demote(finding, 'Re-issued request did not reproduce the sentinel content - target may be '
                                  'patched, or the response has changed since the original scan.')
+    except requests.exceptions.SSLError as e:
+        return _demote(finding, f'Verification request failed due to TLS certificate error: {e}')
     except requests.RequestException as e:
         return _demote(finding, f'Verification request failed: {e}')
 
@@ -181,11 +191,13 @@ def verify_sensitive_file_exposure(finding: dict, session: Optional[requests.Ses
     if signature is None:
         return _demote(finding, f'No known content signature for {filename!r} - cannot verify automatically.')
     try:
-        resp = client.get(url, timeout=_TIMEOUT, verify=False, allow_redirects=False)
+        resp = client.get(url, timeout=_TIMEOUT, verify=_get_verify_setting(session), allow_redirects=False)
         if resp.status_code == 200 and signature(resp.text):
             return _promote(finding, f'Re-fetched {filename} and confirmed its content matches the expected file format.')
         return _demote(finding, 'Re-fetch did not reproduce the expected file content - target may be patched, '
                                  'or access has since been restricted.')
+    except requests.exceptions.SSLError as e:
+        return _demote(finding, f'Verification request failed due to TLS certificate error: {e}')
     except requests.RequestException as e:
         return _demote(finding, f'Verification request failed: {e}')
 
@@ -200,11 +212,13 @@ def verify_directory_listing(finding: dict, session: Optional[requests.Session] 
     if not url:
         return _demote(finding, 'Verification skipped - missing verification_target data.')
     try:
-        resp = client.get(url, timeout=_TIMEOUT, verify=False, allow_redirects=True)
+        resp = client.get(url, timeout=_TIMEOUT, verify=_get_verify_setting(session), allow_redirects=True)
         if resp.status_code == 200 and _DIRECTORY_LISTING_RE.search(resp.text):
             return _promote(finding, 'Re-fetched the URL and confirmed an autoindex-style listing is still present.')
         return _demote(finding, 'Re-fetch did not reproduce the autoindex listing - target may be patched '
                                  'or reconfigured since the original scan.')
+    except requests.exceptions.SSLError as e:
+        return _demote(finding, f'Verification request failed due to TLS certificate error: {e}')
     except requests.RequestException as e:
         return _demote(finding, f'Verification request failed: {e}')
 
@@ -224,18 +238,20 @@ def verify_sqli_time_based(finding: dict, session: Optional[requests.Session] = 
         return _demote(finding, 'Verification skipped - missing verification_target data.')
     try:
         baseline_start = time.monotonic()
-        client.get(url, timeout=_TIMEOUT, verify=False, allow_redirects=False)
+        client.get(url, timeout=_TIMEOUT, verify=_get_verify_setting(session), allow_redirects=False)
         baseline_elapsed = time.monotonic() - baseline_start
 
         probe_start = time.monotonic()
         client.get(_merge_url_params(url, {param: payload}), timeout=_TIMEOUT + expected_delay,
-                    verify=False, allow_redirects=False)
+                    verify=_get_verify_setting(session), allow_redirects=False)
         probe_elapsed = time.monotonic() - probe_start
 
         if probe_elapsed >= (baseline_elapsed + expected_delay - _SQLI_TIME_TOLERANCE):
             return _promote(finding, f'Re-issued payload delayed the response by {probe_elapsed:.1f}s '
                                       f'vs a {baseline_elapsed:.1f}s baseline, consistent with time-based injection.')
         return _demote(finding, 'Re-issued payload did not reproduce the expected response delay.')
+    except requests.exceptions.SSLError as e:
+        return _demote(finding, f'Verification request failed due to TLS certificate error: {e}')
     except requests.RequestException as e:
         return _demote(finding, f'Verification request failed: {e}')
 
@@ -301,12 +317,14 @@ def _xss_payload_fires(url: str, params: dict, marker: str,
     with sync_playwright() as p:
         browser = p.chromium.launch(args=['--no-sandbox', '--disable-gpu'])
         try:
+            ignore_https_errors = not bool(_get_verify_setting(session))
             if session is not None:
-                context = browser.new_context(extra_http_headers=dict(session.headers))
+                context = browser.new_context(extra_http_headers=dict(session.headers),
+                                              ignore_https_errors=ignore_https_errors)
                 context.add_cookies(_playwright_cookies_from_session(session))
                 page = context.new_page()
             else:
-                page = browser.new_page()
+                page = browser.new_page(ignore_https_errors=ignore_https_errors)
             page.on('dialog', _on_dialog)
             page.goto(full_url, timeout=_XSS_NAV_TIMEOUT_MS)
             page.wait_for_timeout(_XSS_POST_LOAD_WAIT_MS)
