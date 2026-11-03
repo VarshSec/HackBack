@@ -533,7 +533,10 @@ Outbound HTTP scanners (`owasp.py`), authentication clients (`auth_login.py`), n
 ### 2. Web Scan Timeouts & Process Cleanup
 - `BoundedZAPv2`: Wraps ZAP API interactions with strict connect (5.0s) and read (25.0s) timeouts to prevent hangs on daemon disconnects.
 - `BoundedTaskRunner`: Runs sub-scanner tasks (ZAP, Katana, Nikto) in daemon threads with bounded execution deadlines. Eliminates ThreadPoolExecutor context manager wait-on-shutdown hangs (`__exit__` calling `shutdown(wait=True)`), guaranteeing stalled threads cannot hold `scan_webscan` beyond its budget.
-- Subprocess tracking & process tree termination: Active subprocesses are tracked in `_active_processes` registry. On timeout, Celery `SoftTimeLimitExceeded`, or module completion, `_terminate_scan_processes` cleanly terminates all running subprocesses and their descendants via `_kill_process_tree`, unlinking temporary output files in `/tmp`.
+- `ScanLifecycleState` & Race-Safe Process Registry: Subprocess registration (`_register_scan_process`) checks the scan lifecycle state under a lock. If the scan has already reached its deadline or been cancelled (`TERMINATED`), late registrations immediately kill the newly created process to eliminate orphan leak races.
+- Shared Monotonic Cleanup Deadline: `_terminate_scan_processes` computes a single deadline capped within the remaining scan budget. All parent and child processes are gathered and terminated concurrently with SIGTERM followed by SIGKILL via collective `psutil.wait_procs`, avoiding serial timeout multiplication across multiple subprocesses.
+- Cancellation-Sensitive Polling: Scan abort events (`_scan_abort_events[scan_id]`) wake up waiting polling loops (`_poll_zap_scan`, `_wait_for_zap`) instantly without sleeping through poll intervals when a scan times out.
+- Surviving PID & Cleanup Tracking: Surviving PIDs and cleanup failures are recorded in the module result envelope (`cleanup_errors`) and logged.
 - `SoftTimeLimitExceeded`: Handled gracefully to preserve all partial findings gathered up to the timeout.
 
 ### 3. Durable Module Results & Failure Recovery

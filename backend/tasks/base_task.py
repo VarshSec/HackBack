@@ -273,6 +273,10 @@ def persist_module_result(scan_id: str, module_name: str, envelope: dict) -> Non
         )
         db.commit()
     except Exception as e:
+        try:
+            db.rollback()
+        except Exception:
+            pass
         logger.error("persist_module_result failed scan=%s module=%s: %s", scan_id, module_name, e)
     finally:
         db.close()
@@ -300,6 +304,10 @@ def get_persisted_module_results(scan_id: str) -> dict:
                 return {r['module']: r for r in module_results if isinstance(r, dict) and 'module' in r}
         return {}
     except Exception as e:
+        try:
+            db.rollback()
+        except Exception:
+            pass
         logger.error("get_persisted_module_results failed scan=%s: %s", scan_id, e)
         return {}
     finally:
