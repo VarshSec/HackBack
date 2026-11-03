@@ -140,14 +140,22 @@ class BoundedTaskRunner:
         self._thread = threading.Thread(target=self._exec, name=name, daemon=True)
 
     def _exec(self):
+        admitted = False
+
         if self.scan_id:
-            _enter_scan_worker(self.scan_id)
+            admitted = _enter_scan_worker(self.scan_id)
+            if not admitted:
+                self.error = RuntimeError(
+                    f"Scan {self.scan_id} was cancelled before worker admission"
+                )
+                return
+
         try:
             self.result = self.target(*self.args, **self.kwargs)
-        except Exception as e:
-            self.error = e
+        except Exception as exc:
+            self.error = exc
         finally:
-            if self.scan_id:
+            if admitted:
                 _exit_scan_worker(self.scan_id)
 
     def start(self):

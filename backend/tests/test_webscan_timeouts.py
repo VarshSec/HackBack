@@ -11,6 +11,9 @@ from tasks.webscan import (
     _lifecycle_lock,
     _scan_states,
     _scan_worker_counts,
+    BoundedTaskRunner,
+    _enter_scan_worker,
+    _exit_scan_worker,
     BoundedZAPv2,
     _kill_process_tree,
     scan_webscan,
@@ -449,3 +452,116 @@ class TestSubprocessLifecycleAndHardening:
             )
         finally:
             server.shutdown()
+
+    def test_worker_cannot_execute_target_when_scan_already_terminated(self):
+        """
+        Prove that a worker thread whose scan was cancelled/terminated before admission
+        never executes self.target(), records a RuntimeError, and does not alter worker accounting.
+        """
+        scan_id = "test-terminated-admission"
+        _init_scan_lifecycle(scan_id)
+        # Scan terminates before worker is admitted
+        _terminate_scan_processes(scan_id, timeout=1.0)
+
+        target_called = threading.Event()
+        def dummy_target():
+            target_called.set()
+            return "executed"
+
+        runner = BoundedTaskRunner(dummy_target, name="test-denied-worker", scan_id=scan_id)
+
+        with _lifecycle_lock:
+            count_before = _scan_worker_counts.get(scan_id, 0)
+
+        runner.start()
+        runner.join(timeout=2.0)
+
+        assert not runner.is_alive, "Runner thread should have completed"
+        assert not target_called.is_set(), "Target MUST NOT be executed when admission fails"
+        assert runner.result is None, "Result should be None on failed admission"
+        assert isinstance(runner.error, RuntimeError), f"Expected RuntimeError, got {runner.error!r}"
+        assert "cancelled before worker admission" in str(runner.error)
+
+        with _lifecycle_lock:
+            count_after = _scan_worker_counts.get(scan_id, 0)
+        assert count_after == count_before, "Worker count must not be decremented if admission failed"
+
+    def test_worker_admission_fails_on_unknown_or_evicted_scan(self):
+        """
+        Prove that if a scan ID is unknown or evicted from lifecycle state,
+        worker admission fails immediately, target is not called, and no underflow occurs.
+        """
+        scan_id = "test-unknown-evicted-scan"
+        target_called = threading.Event()
+        def dummy_target():
+            target_called.set()
+
+        runner = BoundedTaskRunner(dummy_target, name="test-unknown-scan-worker", scan_id=scan_id)
+        runner.start()
+        runner.join(timeout=2.0)
+
+        assert not runner.is_alive
+        assert not target_called.is_set(), "Target must not run on unknown/evicted scan"
+        assert isinstance(runner.error, RuntimeError)
+        assert "cancelled before worker admission" in str(runner.error)
+        with _lifecycle_lock:
+            assert _scan_worker_counts.get(scan_id, 0) == 0
+
+    def test_admitted_worker_executes_and_decrements_count_correctly(self):
+        """
+        Prove that an admitted worker increments count during execution,
+        executes its target, stores the result, and decrements count on exit.
+        """
+        scan_id = "test-admitted-worker"
+        _init_scan_lifecycle(scan_id)
+
+        worker_started = threading.Event()
+        can_finish = threading.Event()
+
+        def sync_target():
+            worker_started.set()
+            can_finish.wait(timeout=2.0)
+            return "success_val"
+
+        runner = BoundedTaskRunner(sync_target, name="test-admitted-worker", scan_id=scan_id)
+        runner.start()
+
+        # Deterministic sync: wait for worker to enter target
+        assert worker_started.wait(timeout=2.0), "Worker did not enter target"
+
+        # While inside target, worker count must be 1
+        with _lifecycle_lock:
+            mid_count = _scan_worker_counts.get(scan_id, 0)
+        assert mid_count == 1, f"Worker count during execution should be 1, got {mid_count}"
+
+        # Allow worker to finish
+        can_finish.set()
+        runner.join(timeout=2.0)
+
+        assert not runner.is_alive
+        assert runner.error is None
+        assert runner.result == "success_val"
+
+        # After worker exits, count must be decremented to 0
+        with _lifecycle_lock:
+            final_count = _scan_worker_counts.get(scan_id, 0)
+        assert final_count == 0, f"Worker count after exit should be 0, got {final_count}"
+
+    def test_worker_without_scan_id_executes_normally(self):
+        """
+        Prove that BoundedTaskRunner without scan_id executes target normally
+        without scan lifecycle accounting.
+        """
+        target_called = threading.Event()
+        def no_scan_target():
+            target_called.set()
+            return 42
+
+        runner = BoundedTaskRunner(no_scan_target, name="no-scan-worker", scan_id=None)
+        runner.start()
+        runner.join(timeout=2.0)
+
+        assert not runner.is_alive
+        assert target_called.is_set()
+        assert runner.result == 42
+        assert runner.error is None
