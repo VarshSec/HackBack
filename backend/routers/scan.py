@@ -315,9 +315,13 @@ def create_scan(request: ScanRequest, http_request: Request, db: Session = Depen
     # Auth credentials never touch the Scan row above or a Celery task arg
     # (Celery logs task args in plaintext at INFO) - stored in Redis, keyed
     # by scan_id, read directly by webscan.py/owasp.py. See auth_store.py.
-    if request.auth:
+    if request.auth or getattr(request, 'auth_secondary', None):
         from tasks.auth_store import store_scan_auth
-        store_scan_auth(str(scan.id), request.auth.model_dump())
+        store_scan_auth(
+            str(scan.id),
+            auth=request.auth.model_dump() if request.auth else None,
+            auth_secondary=request.auth_secondary.model_dump() if getattr(request, 'auth_secondary', None) else None,
+        )
 
     if should_queue:
         # Accepted but waiting for capacity - no dispatch now; the scheduler

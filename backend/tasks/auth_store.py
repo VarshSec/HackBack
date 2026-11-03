@@ -1,28 +1,22 @@
 """
 Ephemeral, per-scan credential store for authenticated scanning.
 
-The password never becomes a Celery task argument: Celery's stock logging
-(`--loglevel=info`, no custom filters exist anywhere in this codebase) reprs
-full task args at INFO for every task-received/task-succeeded line, so
-passing it as a `run_X.s(scan_id, domain, auth)` arg would put it in plaintext
-worker logs on disk. Instead it's written here once (routers/scan.py's
-create_scan()) and read directly by the two tasks that need it (webscan.py,
-owasp.py) - never logged, never passed as a task arg.
+Supports both single-identity scans (legacy webscan, owasp) and dual-identity
+scans (BOLA / IDOR verification).
 
-Never persisted to Postgres (models.py's Scan table) either - there's no
-legitimate reason to retain a scan credential after the scan completes.
-Deleted explicitly in scan_orchestrator.py's _finalize(), alongside the
-ZAP-session-pruning added earlier this session. The TTL below is only a
-backstop for paths that skip _finalize() (e.g. the `cancel` decision, which
-sets status=cancelled directly with no Celery dispatch - Section 4.3b).
+The passwords and tokens never become Celery task arguments: Celery's stock logging
+(`--loglevel=info`) reprs full task args at INFO for every task-received/task-succeeded
+line, so passing credentials as task args would put them in plaintext worker logs on disk.
+Instead, credentials are written here once (routers/scan.py's create_scan()) and read
+directly by the tasks that need them - never logged, never passed as Celery task args.
 
-Caveat worth knowing, not solved here: if Redis persistence (RDB/AOF) is ever
-turned on in docker-compose.yml, a credential could still land on disk via a
-snapshot before its TTL/explicit delete - that's a Redis config knob outside
-this feature's scope.
+Never persisted to PostgreSQL (models.py's Scan table) either - there is no legitimate
+reason to retain scan credentials after the scan completes.
+Deleted explicitly in scan_orchestrator.py's _finalize(). The TTL below is only a
+backstop for paths that skip _finalize() (e.g. the cancel decision).
 """
 import json
-from typing import Optional
+from typing import Optional, Tuple, Dict, Any
 
 import redis
 
@@ -37,14 +31,80 @@ def _key(scan_id: str) -> str:
     return f"scan_auth:{scan_id}"
 
 
-def store_scan_auth(scan_id: str, auth: dict) -> None:
-    _r.setex(_key(scan_id), _TTL_SECONDS, json.dumps(auth))
+def store_scan_auth(
+    scan_id: str,
+    auth: Optional[dict] = None,
+    auth_secondary: Optional[dict] = None,
+) -> None:
+    """
+    Store authentication credentials for a scan in Redis under scan_auth:{scan_id}.
+    Supports both legacy single-identity auth and dual-identity (primary + secondary) auth.
+    Never persists to PostgreSQL.
+    """
+    if auth is None and auth_secondary is None:
+        return
+
+    # Check if auth is already a dual-identity dict containing 'primary' or 'secondary'
+    if isinstance(auth, dict) and ('primary' in auth or 'secondary' in auth):
+        payload = {
+            'primary': auth.get('primary'),
+            'secondary': auth_secondary if auth_secondary is not None else auth.get('secondary'),
+        }
+    else:
+        payload = {
+            'primary': auth,
+            'secondary': auth_secondary,
+        }
+
+    _r.setex(_key(scan_id), _TTL_SECONDS, json.dumps(payload))
 
 
-def get_scan_auth(scan_id: str) -> Optional[dict]:
+def get_scan_auth(scan_id: str, identity: str = 'primary') -> Optional[dict]:
+    """
+    Fetch authentication config for a scan from Redis.
+    Backward compatible with single-identity consumers:
+      - Default identity='primary' returns Identity A (primary) config dict.
+      - identity='secondary' returns Identity B (secondary) config dict (or None if not set).
+      - identity='all' returns {'primary': ..., 'secondary': ...}.
+      - If a legacy single-identity payload was stored (no 'primary' key in JSON),
+        returns the dict directly for 'primary', and None for 'secondary'.
+    """
     raw = _r.get(_key(scan_id))
-    return json.loads(raw) if raw else None
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return None
+
+    if not isinstance(data, dict):
+        return None
+
+    # Dual-identity payload structure
+    if 'primary' in data or 'secondary' in data:
+        if identity == 'all':
+            return data
+        elif identity == 'secondary':
+            return data.get('secondary')
+        else:  # 'primary' or default
+            return data.get('primary')
+
+    # Legacy flat dictionary (single identity)
+    if identity == 'secondary':
+        return None
+    elif identity == 'all':
+        return {'primary': data, 'secondary': None}
+    return data
+
+
+def get_scan_auth_both(scan_id: str) -> Tuple[Optional[dict], Optional[dict]]:
+    """Convenience helper returning (primary_auth, secondary_auth)."""
+    data = get_scan_auth(scan_id, identity='all')
+    if not data or not isinstance(data, dict):
+        return None, None
+    return data.get('primary'), data.get('secondary')
 
 
 def delete_scan_auth(scan_id: str) -> None:
+    """Deletes all authentication credentials associated with the scan."""
     _r.delete(_key(scan_id))

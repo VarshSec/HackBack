@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field, field_validator, field_serializer
+from pydantic import BaseModel, Field, field_validator, field_serializer, model_validator
 from typing import Optional, Dict, List, Literal
 from datetime import datetime, timezone
 from uuid import UUID
@@ -118,6 +118,7 @@ class ScanRequest(BaseModel):
     mode: Literal["quick", "full"] = "full"
     notes: Optional[str] = None
     auth: Optional[AuthConfig] = None
+    auth_secondary: Optional[AuthConfig] = None
     # Domain-ownership claim key (routers/verify.py). Only consulted when
     # config.REQUIRE_DOMAIN_VERIFICATION is True; the secret the caller received
     # after proving control of `domain`. Ignored when verification is disabled.
@@ -127,6 +128,16 @@ class ScanRequest(BaseModel):
     @classmethod
     def validate_domain(cls, v: str) -> str:
         return normalize_domain(v)
+
+    @model_validator(mode="after")
+    def validate_auth_identities(self):
+        if self.auth_secondary and not self.auth:
+            raise ValueError("Primary authentication ('auth') must be configured if 'auth_secondary' is provided")
+        if self.auth and self.auth_secondary:
+            if (self.auth.login_url.strip().lower() == self.auth_secondary.login_url.strip().lower() and
+                self.auth.username.strip().lower() == self.auth_secondary.username.strip().lower()):
+                raise ValueError("Primary and secondary authentication must represent distinct user identities (identical username configured for both)")
+        return self
 
 
 class ScanResponse(BaseModel):
