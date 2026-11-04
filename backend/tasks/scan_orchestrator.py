@@ -133,6 +133,11 @@ def scan_orchestrator(self, scan_id: str, domain: str, mode: str = 'full') -> No
                 db.commit()
         finally:
             db.close()
+        try:
+            from tasks.auth_store import delete_scan_auth
+            delete_scan_auth(scan_id)
+        except Exception:
+            pass
 
 
 # Per-task limit raised from the global 300s/360s default. With Ollama's

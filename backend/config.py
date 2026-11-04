@@ -114,6 +114,11 @@ class Settings(BaseSettings):
     # are never retained indefinitely. Default: 4 hours (14,400s).
     AUTH_CREDENTIAL_TTL_SECONDS: int = 14400
 
+    # Maximum age a scan may wait in the queue before being expired by the reaper (seconds).
+    # Comfortably bounds queue wait within the Redis auth credential TTL.
+    # Default: 4 hours (14,400s).
+    MAX_QUEUE_WAIT_SECONDS: int = 14400
+
     # ── Hosted multi-tenant auth (routers/auth.py). Default OFF, same spirit as
     # REQUIRE_DOMAIN_VERIFICATION above: HACKBACK is single-
     # operator and trusts its operator, so it stays tick-and-go — no signup, no

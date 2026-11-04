@@ -33,6 +33,7 @@ logger = logging.getLogger(__name__)
 from tasks.recon import _RECON_HARD_LIMIT
 from tasks.scan_orchestrator import _AGGREGATE_HARD_LIMIT
 STUCK_SCAN_DEADLINE = timedelta(seconds=_RECON_HARD_LIMIT + _AGGREGATE_HARD_LIMIT + 120)
+MAX_QUEUE_WAIT_DEADLINE = timedelta(seconds=getattr(settings, "MAX_QUEUE_WAIT_SECONDS", 14400))
 
 
 def _is_waiting(scan: Scan) -> bool:
@@ -102,13 +103,26 @@ def _reap_stuck_scans(db: Session) -> int:
     deadline here (unchanged from before).
     """
     cutoff = datetime.utcnow() - STUCK_SCAN_DEADLINE
+    queue_cutoff = datetime.utcnow() - MAX_QUEUE_WAIT_DEADLINE
     stuck = db.query(Scan).filter(
         Scan.status.in_([ScanStatus.queued, ScanStatus.running, ScanStatus.analysing]),
     ).all()
     reaped = 0
     for scan in stuck:
         if _is_waiting(scan):
-            continue  # parked for capacity, not hung - never reap
+            # Parked for capacity: expire only if it exceeds MAX_QUEUE_WAIT_DEADLINE
+            reference_time = scan.created_at
+            if reference_time and reference_time < queue_cutoff:
+                scan.status = ScanStatus.failed
+                scan.notes = (scan.notes + "\n" if scan.notes else "") + f"[Error] Queued scan exceeded maximum queue wait deadline ({MAX_QUEUE_WAIT_DEADLINE.total_seconds()}s) and was expired."
+                reaped += 1
+                try:
+                    from tasks.auth_store import delete_scan_auth
+                    delete_scan_auth(str(scan.id))
+                except Exception:
+                    pass
+            continue
+
         reference_time = scan.started_at or scan.created_at
         if reference_time and reference_time < cutoff:
             scan.status = ScanStatus.failed
@@ -327,6 +341,8 @@ def create_scan(request: ScanRequest, http_request: Request, db: Session = Depen
             auth=request.auth.model_dump() if request.auth else None,
             auth_secondary=request.auth_secondary.model_dump() if getattr(request, 'auth_secondary', None) else None,
         )
+        scan.raw_findings = {**(scan.raw_findings or {}), "auth_required": True}
+        db.commit()
 
     if should_queue:
         # Accepted but waiting for capacity - no dispatch now; the scheduler
@@ -501,21 +517,37 @@ def get_scan_status(scan_id: UUID, http_request: Request, db: Session = Depends(
         promote_queued_scans()
         db.refresh(scan)
 
-    if scan.status in (ScanStatus.queued, ScanStatus.running, ScanStatus.analysing) and not _is_waiting(scan):
-        reference_time = scan.started_at or scan.created_at
-        if reference_time and datetime.utcnow() - reference_time > STUCK_SCAN_DEADLINE:
-            logger.error(
-                "Scan %s stuck in %s past deadline (reference=%s) - marking failed, "
-                "likely a hard-timeout SIGKILL on one of the scanning modules",
-                scan.id, scan.status.value, reference_time,
-            )
-            scan.status = ScanStatus.failed
-            db.commit()
-            try:
-                from tasks.auth_store import delete_scan_auth
-                delete_scan_auth(str(scan.id))
-            except Exception:
-                pass
+    if scan.status in (ScanStatus.queued, ScanStatus.running, ScanStatus.analysing):
+        if _is_waiting(scan):
+            reference_time = scan.created_at
+            if reference_time and datetime.utcnow() - reference_time > MAX_QUEUE_WAIT_DEADLINE:
+                logger.error(
+                    "Scan %s waiting in queue past max queue wait deadline (%s) - marking failed",
+                    scan.id, reference_time,
+                )
+                scan.status = ScanStatus.failed
+                scan.notes = (scan.notes + "\n" if scan.notes else "") + f"[Error] Queued scan exceeded maximum queue wait deadline ({MAX_QUEUE_WAIT_DEADLINE.total_seconds()}s) and was expired."
+                db.commit()
+                try:
+                    from tasks.auth_store import delete_scan_auth
+                    delete_scan_auth(str(scan.id))
+                except Exception:
+                    pass
+        else:
+            reference_time = scan.started_at or scan.created_at
+            if reference_time and datetime.utcnow() - reference_time > STUCK_SCAN_DEADLINE:
+                logger.error(
+                    "Scan %s stuck in %s past deadline (reference=%s) - marking failed, "
+                    "likely a hard-timeout SIGKILL on one of the scanning modules",
+                    scan.id, scan.status.value, reference_time,
+                )
+                scan.status = ScanStatus.failed
+                db.commit()
+                try:
+                    from tasks.auth_store import delete_scan_auth
+                    delete_scan_auth(str(scan.id))
+                except Exception:
+                    pass
 
     module_errors = _compute_module_errors(scan)
     can_retry = None

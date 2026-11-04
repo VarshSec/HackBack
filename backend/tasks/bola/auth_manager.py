@@ -18,11 +18,13 @@ Core Guarantees:
    indiscriminately.
 4. Independent Failure Semantics: Failure to authenticate Identity B never invalidates
    Identity A, but explicitly marks two-identity BOLA verification as inconclusive.
-5. Secret Redaction & Comprehensive Cleanup: Passwords, bearer tokens, cookies, and
+5. Secret Redaction & Reference Cleanup: Passwords, bearer tokens, cookies, and
    authorization headers are never logged or exposed in serialized string representations.
-   Calling close() or exiting context manager strictly wipes all sessions, cookies,
-   headers, passwords, and bearer tokens from memory while preserving non-sensitive
-   diagnostic telemetry for audit reporting.
+   Calling close() or exiting context manager clears all session cookies and headers,
+   clears internal dictionary references to credentials, releases retained bearer token
+   references, and resets internal state while preserving non-sensitive diagnostic
+   telemetry for audit reporting. Note: physical memory zeroization of immutable string
+   objects is not guaranteed by Python once references are released.
 
 Authentication Validation Architecture (Three-Tier Model):
 The BOLA verification engine strictly distinguishes between:
@@ -541,17 +543,19 @@ class SessionIdentityManager:
 
     def close(self) -> None:
         """
-        Safely close all identity sessions and clear sensitive state from memory.
+        Safely close all identity sessions and clear sensitive credential references.
         Idempotent: safe to call multiple times without error.
         Preserves non-sensitive diagnostic telemetry (outcomes, timestamps, refresh counts)
-        for scan reporting while erasing all plaintext secrets, tokens, headers, and cookies.
+        for scan reporting while clearing session cookies and headers, internal credential
+        dictionaries, and retained token references. Note: physical memory zeroization of
+        immutable string objects is not guaranteed by Python.
         """
         with self._lock:
             if self._closed:
                 return
             self._closed = True
 
-            # 1. Close every existing requests.Session and clear cookies/headers
+            # 1. Close every existing requests.Session and clear session cookies/headers
             for ident, sess in list(self._sessions.items()):
                 if sess is not None:
                     try:
@@ -568,7 +572,7 @@ class SessionIdentityManager:
                         pass
                     self._sessions[ident] = None
 
-            # 2. Clear primary and secondary credential dictionaries from memory
+            # 2. Clear internal credential dictionary references
             for ident in list(self._auth_configs.keys()):
                 auth = self._auth_configs[ident]
                 if isinstance(auth, dict):
@@ -577,7 +581,7 @@ class SessionIdentityManager:
                     auth.clear()
                 self._auth_configs[ident] = None
 
-            # 3. Clear sensitive tokens and authorization header strings from state tracking
+            # 3. Release retained token references and authorization header strings from state tracking
             for ident, st in self._states.items():
                 st._token_val = None
                 st.token_header = None

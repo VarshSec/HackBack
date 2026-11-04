@@ -100,5 +100,34 @@ class TestFailureBecomesEnvelope:
         assert 'ValueError' in out['error']
 
 
+class TestChordDispatchFailureCleanup:
+    """Verifies that a Celery chord dispatch failure in scan_orchestrator cleans up auth credentials."""
+
+    def test_chord_failure_marks_failed_and_deletes_auth_key(self):
+        from tasks.scan_orchestrator import scan_orchestrator
+        from models import Scan, ScanStatus
+
+        scan_id = "chord-fail-uuid"
+        other_scan_id = "other-scan-uuid"
+
+        mock_scan = MagicMock(spec=Scan)
+        mock_scan.id = scan_id
+        mock_scan.status = ScanStatus.running
+
+        mock_db = MagicMock()
+        mock_db.query.return_value.filter.return_value.first.return_value = mock_scan
+
+        deleted_keys = []
+        with patch("database.SessionLocal", return_value=mock_db), \
+             patch("tasks.scan_orchestrator.chord", side_effect=RuntimeError("Redis broker connection lost")), \
+             patch("tasks.auth_store.delete_scan_auth", side_effect=lambda sid: deleted_keys.append(sid)):
+
+            scan_orchestrator(scan_id, "example.com", "quick")
+
+            assert mock_scan.status == ScanStatus.failed
+            assert scan_id in deleted_keys
+            assert other_scan_id not in deleted_keys
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])

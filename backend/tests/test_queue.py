@@ -10,7 +10,7 @@ Run with:
 import os
 import sys
 from datetime import datetime, timedelta
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
 import pytest
@@ -56,6 +56,8 @@ def _mock_scan(status=ScanStatus.queued, dispatched_at=None):
     s.created_at = datetime.utcnow()
     s.started_at = None
     s.module_statuses = {}
+    s.raw_findings = None
+    s.notes = None
     s.scan_type = "full"
     return s
 
@@ -159,6 +161,32 @@ class TestReaperExemption:
         assert reaped == 0
         assert waiting.status == ScanStatus.queued  # untouched
 
+    def test_waiting_scan_exceeding_max_queue_wait_is_reaped_and_auth_deleted(self, monkeypatch):
+        monkeypatch.setattr(settings, "HOSTED_QUEUE_ENABLED", True)
+        waiting = _mock_scan(status=ScanStatus.queued, dispatched_at=None)
+        waiting.id = "expired-queue-uuid"
+        waiting.created_at = datetime.utcnow() - scan_router.MAX_QUEUE_WAIT_DEADLINE - timedelta(seconds=10)
+        db = MagicMock()
+        db.query.return_value.filter.return_value.all.return_value = [waiting]
+
+        with patch("tasks.auth_store.delete_scan_auth") as mock_del:
+            reaped = scan_router._reap_stuck_scans(db)
+            assert reaped == 1
+            assert waiting.status == ScanStatus.failed
+            assert "exceeded maximum queue wait deadline" in (waiting.notes or "")
+            mock_del.assert_called_once_with("expired-queue-uuid")
+
+    def test_waiting_scan_within_max_queue_wait_not_reaped(self, monkeypatch):
+        monkeypatch.setattr(settings, "HOSTED_QUEUE_ENABLED", True)
+        waiting = _mock_scan(status=ScanStatus.queued, dispatched_at=None)
+        waiting.created_at = datetime.utcnow() - timedelta(hours=1)
+        db = MagicMock()
+        db.query.return_value.filter.return_value.all.return_value = [waiting]
+
+        reaped = scan_router._reap_stuck_scans(db)
+        assert reaped == 0
+        assert waiting.status == ScanStatus.queued
+
     def test_dispatched_stuck_scan_still_reaped(self, monkeypatch):
         monkeypatch.setattr(settings, "HOSTED_QUEUE_ENABLED", True)
         stuck = _mock_scan(status=ScanStatus.running, dispatched_at=datetime.utcnow())
@@ -183,3 +211,83 @@ class TestIsWaiting:
     def test_false_when_flag_off(self, monkeypatch):
         monkeypatch.setattr(settings, "HOSTED_QUEUE_ENABLED", False)
         assert scan_router._is_waiting(_mock_scan(ScanStatus.queued, None)) is False
+
+
+class TestQueuePromotionAuthValidation:
+    """Verifies queue promotion behavior with valid and expired scan credentials."""
+
+    def test_normal_queue_promotion_preserves_credentials(self, monkeypatch):
+        monkeypatch.setattr(settings, "HOSTED_QUEUE_ENABLED", True)
+        scan = _mock_scan(status=ScanStatus.queued, dispatched_at=None)
+        scan.id = "promo-valid-uuid"
+        scan.raw_findings = {"auth_required": True}
+        scan.domain = "target.test"
+        scan.scan_type = "quick"
+
+        mock_db = MagicMock()
+        mock_db.query.return_value.filter.return_value.count.return_value = 0
+        mock_db.query.return_value.filter.return_value.order_by.return_value.limit.return_value.all.return_value = [scan]
+
+        with patch("database.SessionLocal", return_value=mock_db), \
+             patch("tasks.auth_store.touch_scan_auth", return_value=True) as mock_touch, \
+             patch("tasks.scan_orchestrator.scan_orchestrator.delay") as mock_delay:
+
+            from tasks.queue_scheduler import promote_queued_scans
+            promoted = promote_queued_scans()
+
+            assert promoted == 1
+            mock_touch.assert_called_once_with("promo-valid-uuid")
+            mock_delay.assert_called_once_with("promo-valid-uuid", "target.test", "quick")
+            assert scan.dispatched_at is not None
+
+    def test_expired_redis_credentials_at_promotion_prevents_dispatch(self, monkeypatch):
+        """If required credentials expired in Redis, promotion must NOT dispatch and marks scan failed."""
+        monkeypatch.setattr(settings, "HOSTED_QUEUE_ENABLED", True)
+        scan = _mock_scan(status=ScanStatus.queued, dispatched_at=None)
+        scan.id = "promo-expired-uuid"
+        scan.raw_findings = {"auth_required": True}
+        scan.domain = "target.test"
+        scan.scan_type = "quick"
+
+        mock_db = MagicMock()
+        mock_db.query.return_value.filter.return_value.count.return_value = 0
+        mock_db.query.return_value.filter.return_value.order_by.return_value.limit.return_value.all.return_value = [scan]
+
+        with patch("database.SessionLocal", return_value=mock_db), \
+             patch("tasks.auth_store.touch_scan_auth", return_value=False) as mock_touch, \
+             patch("tasks.auth_store.delete_scan_auth") as mock_del, \
+             patch("tasks.scan_orchestrator.scan_orchestrator.delay") as mock_delay:
+
+            from tasks.queue_scheduler import promote_queued_scans
+            promoted = promote_queued_scans()
+
+            assert promoted == 0
+            mock_touch.assert_called_once_with("promo-expired-uuid")
+            mock_delay.assert_not_called()
+            assert scan.status == ScanStatus.failed
+            assert "expired while waiting in queue" in (scan.notes or "")
+            assert scan.dispatched_at is None
+            mock_del.assert_called_once_with("promo-expired-uuid")
+
+    def test_unauthenticated_scan_promotion_dispatches_without_requiring_credentials(self, monkeypatch):
+        """Scans submitted without authentication are promoted normally without checking for auth keys."""
+        monkeypatch.setattr(settings, "HOSTED_QUEUE_ENABLED", True)
+        scan = _mock_scan(status=ScanStatus.queued, dispatched_at=None)
+        scan.id = "unauth-scan-uuid"
+        scan.raw_findings = None
+        scan.domain = "unauth.test"
+        scan.scan_type = "quick"
+
+        mock_db = MagicMock()
+        mock_db.query.return_value.filter.return_value.count.return_value = 0
+        mock_db.query.return_value.filter.return_value.order_by.return_value.limit.return_value.all.return_value = [scan]
+
+        with patch("database.SessionLocal", return_value=mock_db), \
+             patch("tasks.scan_orchestrator.scan_orchestrator.delay") as mock_delay:
+
+            from tasks.queue_scheduler import promote_queued_scans
+            promoted = promote_queued_scans()
+
+            assert promoted == 1
+            mock_delay.assert_called_once_with("unauth-scan-uuid", "unauth.test", "quick")
+            assert scan.dispatched_at is not None

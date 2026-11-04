@@ -85,8 +85,33 @@ def promote_queued_scans() -> int:
 
         now = datetime.utcnow()
         for scan in waiting:
+            scan_id = str(scan.id)
+            requires_auth = bool((scan.raw_findings or {}).get("auth_required"))
+            if requires_auth:
+                from tasks.auth_store import touch_scan_auth
+                has_auth = touch_scan_auth(scan_id)
+                if not has_auth:
+                    logger.error(
+                        "promote_queued_scans: scan %s required authentication but credentials expired or missing in Redis - marking failed",
+                        scan_id,
+                    )
+                    scan.status = ScanStatus.failed
+                    scan.notes = (scan.notes + "\n" if scan.notes else "") + "[Error] Scan authentication credentials expired while waiting in queue before promotion."
+                    try:
+                        from tasks.auth_store import delete_scan_auth
+                        delete_scan_auth(scan_id)
+                    except Exception:
+                        pass
+                    continue
+            else:
+                try:
+                    from tasks.auth_store import touch_scan_auth
+                    touch_scan_auth(scan_id)
+                except Exception:
+                    pass
+
             scan.dispatched_at = now
-            promoted.append((str(scan.id), scan.domain, scan.scan_type))
+            promoted.append((scan_id, scan.domain, scan.scan_type))
         db.commit()  # releases the advisory lock; slots are now claimed
     except Exception:
         logger.exception("promote_queued_scans: failed during claim")
@@ -103,11 +128,6 @@ def promote_queued_scans() -> int:
     dispatched = 0
     for scan_id, domain, mode in promoted:
         try:
-            try:
-                from tasks.auth_store import touch_scan_auth
-                touch_scan_auth(scan_id)
-            except Exception:
-                pass
             scan_orchestrator.delay(scan_id, domain, mode)
             dispatched += 1
             logger.info("promote_queued_scans: started queued scan %s (%s)", scan_id, domain)
