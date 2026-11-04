@@ -19,7 +19,7 @@ returns immediately, so none of this touches the DB and dispatched_at stays NULL
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from sqlalchemy import text
 
@@ -81,11 +81,42 @@ def promote_queued_scans() -> int:
         waiting = db.query(Scan).filter(
             Scan.status == ScanStatus.queued,
             Scan.dispatched_at.is_(None),
-        ).order_by(Scan.created_at.asc()).limit(free).all()
+        ).order_by(Scan.created_at.asc()).all()
 
         now = datetime.utcnow()
+        max_queue_wait = timedelta(seconds=getattr(settings, "MAX_QUEUE_WAIT_SECONDS", 14400))
+
         for scan in waiting:
+            if len(promoted) >= free:
+                break
+
             scan_id = str(scan.id)
+
+            # 1. Enforce queue deadline before touching Redis credentials
+            is_expired = False
+            if not scan.created_at or not isinstance(scan.created_at, datetime):
+                is_expired = True
+                expiration_reason = "missing or invalid creation timestamp"
+            elif (now - scan.created_at) > max_queue_wait:
+                is_expired = True
+                expiration_reason = f"exceeded maximum queue wait age of {int(max_queue_wait.total_seconds())}s"
+
+            if is_expired:
+                logger.error(
+                    "promote_queued_scans: scan %s expired in queue (%s) - marking failed",
+                    scan_id,
+                    expiration_reason,
+                )
+                scan.status = ScanStatus.failed
+                scan.notes = (scan.notes + "\n" if scan.notes else "") + f"[Error] Queued scan expired before promotion: {expiration_reason}."
+                try:
+                    from tasks.auth_store import delete_scan_auth
+                    delete_scan_auth(scan_id)
+                except Exception:
+                    pass
+                continue
+
+            # 2. Authenticated scan credentials verification
             requires_auth = bool((scan.raw_findings or {}).get("auth_required"))
             if requires_auth:
                 from tasks.auth_store import touch_scan_auth
