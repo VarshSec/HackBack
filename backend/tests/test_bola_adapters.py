@@ -392,6 +392,87 @@ class TestURLScopeEnforcement:
         assert in_scope is True  # Target host itself still works
         assert res == "https://target.test/api"
 
+    def test_url_port_validation(self):
+        """
+        Validates URL port handling across absolute URLs, base_url, and allowlist:
+        - Non-numeric ports rejected.
+        - Out-of-range ports (<=0 or >65535) rejected.
+        - Valid explicit ports (1-65535) accepted.
+        - No-port URLs remain accepted.
+        - Invalid port in base_url fails closed.
+        - Invalid port in approved subdomain rejected even if subdomain is allowed.
+        """
+        # 1. Out-of-range port rejected
+        in_scope, res = is_url_in_scope("https://target.test:99999/api", "target.test")
+        assert in_scope is False
+        assert res is None
+
+        # 2. Non-numeric port rejected
+        in_scope, res = is_url_in_scope("https://target.test:invalid/api", "target.test")
+        assert in_scope is False
+        assert res is None
+
+        # 3. Port 0 rejected
+        in_scope, res = is_url_in_scope("https://target.test:0/api", "target.test")
+        assert in_scope is False
+        assert res is None
+
+        # 4. Valid explicit port accepted
+        in_scope, res = is_url_in_scope("https://target.test:443/api", "target.test")
+        assert in_scope is True
+        assert res == "https://target.test:443/api"
+
+        in_scope, res = is_url_in_scope("http://target.test:8080/api", "target.test")
+        assert in_scope is True
+        assert res == "http://target.test:8080/api"
+
+        # 5. Approved subdomain with invalid port rejected even when explicitly approved
+        in_scope, res = is_url_in_scope(
+            "https://api.target.test:99999/api",
+            "target.test",
+            allowed_subdomains=["api.target.test"],
+        )
+        assert in_scope is False
+        assert res is None
+
+        # 6. Valid approved subdomain with valid port accepted
+        in_scope, res = is_url_in_scope(
+            "https://api.target.test:8443/api",
+            "target.test",
+            allowed_subdomains=["api.target.test"],
+        )
+        assert in_scope is True
+        assert res == "https://api.target.test:8443/api"
+
+        # 7. Invalid port in base_url rejected
+        for bad_base in ("https://target.test:99999", "https://target.test:invalid", "https://target.test:0", "https://target.test:"):
+            in_scope, res = is_url_in_scope("/api/v1/orders", "target.test", base_url=bad_base)
+            assert in_scope is False
+            assert res is None
+
+        # 8. No-port URLs remain accepted
+        in_scope, res = is_url_in_scope("https://target.test/api", "target.test")
+        assert in_scope is True
+        assert res == "https://target.test/api"
+
+        in_scope, res = is_url_in_scope("/api/v1/orders", "target.test", base_url="https://target.test")
+        assert in_scope is True
+        assert res == "https://target.test/api/v1/orders"
+
+        # 9. Empty port rejected
+        in_scope, res = is_url_in_scope("https://target.test:/api", "target.test")
+        assert in_scope is False
+        assert res is None
+
+        # 10. Malformed port in allowlist entry does not authorize
+        in_scope, res = is_url_in_scope(
+            "https://api.target.test/api",
+            "target.test",
+            allowed_subdomains=["api.target.test:99999"],
+        )
+        assert in_scope is False
+        assert res is None
+
 
 # ---------------------------------------------------------------------------
 # JavaScript Tests

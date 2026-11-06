@@ -12,11 +12,40 @@ import urllib.parse
 from typing import Iterable, Optional, Set, Tuple
 
 
+def is_valid_port_spec(parsed: urllib.parse.SplitResult) -> bool:
+    """
+    Validates the port component of a parsed URL.
+    - True if no explicit port is specified.
+    - True if an explicit port is present and is an integer in 1..65535.
+    - False if port is non-numeric, out of range (<=0 or >65535), or empty (e.g. 'host:').
+    """
+    try:
+        port = parsed.port
+    except Exception:
+        return False
+
+    if port is not None:
+        return 1 <= port <= 65535
+
+    # Check for empty port specifications like 'http://host:/path' or 'host:'
+    netloc = parsed.netloc or ""
+    host_port = netloc.split("@")[-1]
+    if "]" in host_port:
+        rest = host_port.split("]")[-1]
+    else:
+        rest = host_port
+    if ":" in rest:
+        return False
+
+    return True
+
+
 def normalize_target_host(target_domain: str) -> str:
     """
     Extracts, lowercases, and normalizes a target host string.
     Strips schemes, trailing paths, port numbers, and trailing dots.
-    Fails closed (returns empty string) on invalid or malformed input.
+    Fails closed (returns empty string) on invalid or malformed input,
+    including invalid or out-of-range port numbers.
     """
     if not target_domain or not isinstance(target_domain, str):
         return ""
@@ -26,18 +55,16 @@ def normalize_target_host(target_domain: str) -> str:
         return ""
 
     try:
-        if "://" in domain:
-            parsed = urllib.parse.urlsplit(domain)
-            domain = parsed.hostname or domain
-        else:
-            # Strip trailing path if present
-            domain = domain.split("/")[0]
-            # Strip port if present (and not an IPv6 literal)
-            if ":" in domain and not domain.startswith("["):
-                domain = domain.split(":")[0]
+        url_to_parse = domain if "://" in domain else f"//{domain}"
+        parsed = urllib.parse.urlsplit(url_to_parse)
 
+        # Validate port if specified
+        if not is_valid_port_spec(parsed):
+            return ""
+
+        host = parsed.hostname or ""
         # Strip trailing dot (DNS root) and surrounding whitespace
-        return domain.strip().rstrip(".").lower()
+        return host.strip().rstrip(".").lower()
     except Exception:
         return ""
 
@@ -122,6 +149,15 @@ def is_url_in_scope(
             if base_url:
                 try:
                     base_parsed = urllib.parse.urlsplit(base_url)
+                    # Validate base_url port specification
+                    if not is_valid_port_spec(base_parsed):
+                        return False, None
+                    # Reject unsupported schemes in base_url
+                    if base_parsed.scheme.lower() not in ("http", "https"):
+                        return False, None
+                    # Reject user-info in base_url
+                    if base_parsed.username or base_parsed.password or ("@" in base_parsed.netloc):
+                        return False, None
                     base_host = (base_parsed.hostname or "").strip().rstrip(".").lower()
                     if not base_host or (base_host != target_host and base_host not in approved_hosts):
                         return False, None
@@ -138,16 +174,20 @@ def is_url_in_scope(
         except Exception:
             return False, None
 
-        # 1. Reject unsupported schemes
+        # 1. Validate port specification on parsed URL
+        if not is_valid_port_spec(parsed):
+            return False, None
+
+        # 2. Reject unsupported schemes
         scheme = parsed.scheme.lower()
         if scheme and scheme not in ("http", "https"):
             return False, None
 
-        # 2. Reject URL user-info credentials (e.g. user:pass@host)
+        # 3. Reject URL user-info credentials (e.g. user:pass@host)
         if parsed.username or parsed.password or ("@" in parsed.netloc):
             return False, None
 
-        # 3. Check hostname if absolute URL
+        # 4. Check hostname if absolute URL
         host = (parsed.hostname or "").strip().rstrip(".").lower()
         if host:
             # Exact target host or explicitly approved genuine subdomain
