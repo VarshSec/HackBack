@@ -1,9 +1,19 @@
 """
 Master Candidate Endpoint & Resource Extraction Pipeline Orchestrator.
 
-Ingests heterogeneous discovery sources (OpenAPI specs, JavaScript assets,
-HTML pages, crawled URLs, and traffic observations) and produces a deduplicated,
-evidence-backed, confidence-scored candidate inventory.
+Architecture & Scope Integration Boundaries:
+1. Live Scan Integration:
+   - Automated live scans continuously observe HTTP traffic and discovery results
+     (Katana crawled endpoints, FFUF brute-forced paths, OWASP spidered endpoints).
+   - These are ingested via `ingest_crawled_url` and `ingest_traffic_observation`.
+2. Standalone Adapters:
+   - OpenAPI specifications, raw JavaScript bundles, and static HTML files are
+     supported via dedicated parsers (OpenAPIParser, JavaScriptParser, HTMLPageParser).
+   - They provide rich static contract and code intelligence, callable programmatically
+     or via targeted scan configurations.
+3. Centralized Scope & Safety:
+   - All discovery sources enforce `tasks.bola.scope.is_url_in_scope` to prevent
+     ingesting out-of-scope, lookalike, or credential-leaking URLs.
 """
 from __future__ import annotations
 
@@ -30,6 +40,7 @@ from tasks.bola.resource_detector import (
     extract_json_parameters,
     extract_query_parameters,
 )
+from tasks.bola.scope import is_url_in_scope
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +60,12 @@ class EndpointExtractorPipeline:
     def ingest_openapi_spec(self, raw_spec: str | Dict[str, Any], source_uri: str = "openapi.json") -> int:
         """Parses and ingests an OpenAPI/Swagger specification."""
         try:
+            if source_uri.startswith(("http://", "https://")):
+                in_scope, _ = is_url_in_scope(source_uri, self.target_domain, base_url=self.base_url)
+                if not in_scope:
+                    logger.warning("EndpointExtractor: OpenAPI source_uri out of scope: %s", source_uri)
+                    return 0
+
             parser = OpenAPIParser(raw_spec, source_uri=source_uri)
             candidates = parser.extract_candidates(scan_id=self.scan_id, target_domain=self.target_domain)
             self.store.add_all(candidates)
@@ -82,11 +99,11 @@ class EndpointExtractorPipeline:
     def ingest_crawled_url(self, url: str, method: str = "GET", source: str = "katana") -> bool:
         """Ingests a single crawled URL (from Katana, FFUF, or web crawler)."""
         try:
-            parsed = urllib.parse.urlsplit(url)
-            host = (parsed.hostname or "").lower()
-            if host and host != self.target_domain and not host.endswith(f".{self.target_domain}"):
+            in_scope, clean_url = is_url_in_scope(url, self.target_domain, base_url=self.base_url)
+            if not in_scope or not clean_url:
                 return False
 
+            parsed = urllib.parse.urlsplit(clean_url)
             norm_template, resource_type, path_params = normalize_url_path(parsed.path)
             parameters: List[CandidateParameter] = list(path_params)
 
@@ -97,8 +114,8 @@ class EndpointExtractorPipeline:
             ev = EvidenceRecord(
                 source=source,
                 parser="CrawledURLAdapter",
-                location=url,
-                snippet=f"{method.upper()} {url}",
+                location=clean_url,
+                snippet=f"{method.upper()} {clean_url}",
                 confidence_signals=["observed_http_traffic"],
             )
 
@@ -108,7 +125,7 @@ class EndpointExtractorPipeline:
                 scan_id=self.scan_id,
                 target_domain=self.target_domain,
                 method=method.upper(),
-                original_url=url,
+                original_url=clean_url,
                 route_template=norm_template,
                 resource_type=resource_type,
                 parameters=parameters,
@@ -134,7 +151,11 @@ class EndpointExtractorPipeline:
     ) -> bool:
         """Ingests an observed HTTP request/response transaction."""
         try:
-            parsed = urllib.parse.urlsplit(url)
+            in_scope, clean_url = is_url_in_scope(url, self.target_domain, base_url=self.base_url)
+            if not in_scope or not clean_url:
+                return False
+
+            parsed = urllib.parse.urlsplit(clean_url)
             norm_template, resource_type, path_params = normalize_url_path(parsed.path)
             parameters: List[CandidateParameter] = list(path_params)
 
@@ -149,8 +170,8 @@ class EndpointExtractorPipeline:
             ev = EvidenceRecord(
                 source="traffic",
                 parser="TrafficObserver",
-                location=url,
-                snippet=f"{method.upper()} {url} -> HTTP {status_code}",
+                location=clean_url,
+                snippet=f"{method.upper()} {clean_url} -> HTTP {status_code}",
                 confidence_signals=["observed_http_traffic"],
             )
 
@@ -160,7 +181,7 @@ class EndpointExtractorPipeline:
                 scan_id=self.scan_id,
                 target_domain=self.target_domain,
                 method=method.upper(),
-                original_url=url,
+                original_url=clean_url,
                 route_template=norm_template,
                 resource_type=resource_type,
                 parameters=parameters,

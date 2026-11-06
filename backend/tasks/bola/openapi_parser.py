@@ -180,8 +180,9 @@ class OpenAPIParser:
         if not isinstance(paths, dict):
             return candidates
 
-        # Check for global security declarations
-        has_global_security = bool(self.spec.get("security"))
+        # Check for global root-level security declarations
+        root_security = self.spec.get("security")
+        has_root_security = isinstance(root_security, list) and len(root_security) > 0
 
         for path_str, path_item in paths.items():
             if not isinstance(path_item, dict):
@@ -201,9 +202,17 @@ class OpenAPIParser:
                 operation_id = op.get("operationId", "")
                 summary = op.get("summary") or op.get("description") or ""
 
-                # Security context
-                op_security = op.get("security")
-                is_authenticated = bool(op_security) or (has_global_security and op_security is not [])
+                # Security context resolution:
+                # 1. Missing operation-level security: inherit root-level security.
+                # 2. Explicit empty operation-level security ([]): unauthenticated.
+                # 3. Non-empty operation-level security: authenticated.
+                # 4. Missing root-level and missing operation-level: unauthenticated.
+                if "security" in op:
+                    op_security = op.get("security")
+                    is_authenticated = isinstance(op_security, list) and len(op_security) > 0
+                else:
+                    is_authenticated = has_root_security
+
                 auth_context = "primary" if is_authenticated else "anonymous"
 
                 # Combine path-level and operation-level parameters

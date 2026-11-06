@@ -13,6 +13,7 @@ from tasks.bola.javascript_parser import JavaScriptParser
 from tasks.bola.html_parser import HTMLPageParser
 from tasks.bola.candidate_store import CandidateStore
 from tasks.bola.endpoint_extractor import EndpointExtractorPipeline
+from tasks.bola.scope import is_url_in_scope
 
 
 # ---------------------------------------------------------------------------
@@ -161,6 +162,118 @@ paths:
         parser = OpenAPIParser(spec)
         res = parser.resolve_ref("#/components/schemas/Node")
         assert res is not None
+
+    def test_openapi_security_inheritance_rules(self):
+        spec = {
+            "openapi": "3.0.0",
+            "info": {"title": "Secured API", "version": "1.0"},
+            "security": [{"bearerAuth": []}],  # Root-level security
+            "paths": {
+                "/api/inherited": {
+                    "get": {
+                        "summary": "Inherits root security",
+                        "responses": {"200": {"description": "OK"}},
+                    }
+                },
+                "/api/public": {
+                    "get": {
+                        "summary": "Explicitly public operation",
+                        "security": [],  # Explicit empty security: must be anonymous
+                        "responses": {"200": {"description": "OK"}},
+                    }
+                },
+                "/api/custom-auth": {
+                    "get": {
+                        "summary": "Explicit custom auth",
+                        "security": [{"apiKeyAuth": []}],
+                        "responses": {"200": {"description": "OK"}},
+                    }
+                },
+            }
+        }
+        parser = OpenAPIParser(spec)
+        candidates = parser.extract_candidates(scan_id="sec-scan", target_domain="sec.example")
+        assert len(candidates) == 3
+
+        c_inherited = next(c for c in candidates if c.route_template == "/api/inherited")
+        assert c_inherited.authentication_context == "primary"
+
+        c_public = next(c for c in candidates if c.route_template == "/api/public")
+        assert c_public.authentication_context == "anonymous"
+
+        c_custom = next(c for c in candidates if c.route_template == "/api/custom-auth")
+        assert c_custom.authentication_context == "primary"
+
+        # Case where root has no security
+        spec_no_root = {
+            "openapi": "3.0.0",
+            "paths": {
+                "/api/anon": {
+                    "get": {
+                        "summary": "Default anon when no root security",
+                        "responses": {"200": {"description": "OK"}},
+                    }
+                },
+                "/api/protected": {
+                    "get": {
+                        "summary": "Operation with auth even without root",
+                        "security": [{"oauth2": []}],
+                        "responses": {"200": {"description": "OK"}},
+                    }
+                }
+            }
+        }
+        parser_no_root = OpenAPIParser(spec_no_root)
+        cands_no_root = parser_no_root.extract_candidates(scan_id="sec-scan", target_domain="sec.example")
+        assert len(cands_no_root) == 2
+
+        c_anon = next(c for c in cands_no_root if c.route_template == "/api/anon")
+        assert c_anon.authentication_context == "anonymous"
+
+        c_prot = next(c for c in cands_no_root if c.route_template == "/api/protected")
+        assert c_prot.authentication_context == "primary"
+
+
+class TestURLScopeEnforcement:
+    def test_scope_allowed_targets(self):
+        in_scope, res = is_url_in_scope("https://target.test/api/v1", "target.test")
+        assert in_scope is True
+        assert res == "https://target.test/api/v1"
+
+        in_scope, res = is_url_in_scope("https://api.target.test/v1/users", "target.test")
+        assert in_scope is True
+        assert res == "https://api.target.test/v1/users"
+
+        # Relative path with base_url
+        in_scope, res = is_url_in_scope("/api/v1/orders", "target.test", base_url="https://target.test")
+        assert in_scope is True
+        assert res == "https://target.test/api/v1/orders"
+
+        # Relative path without base_url
+        in_scope, res = is_url_in_scope("/api/v1/orders", "target.test")
+        assert in_scope is True
+        assert res == "/api/v1/orders"
+
+    def test_scope_rejected_targets(self):
+        # Lookalike domains
+        assert is_url_in_scope("https://target.test.attacker.test/api", "target.test")[0] is False
+        assert is_url_in_scope("https://nottarget.test/api", "target.test")[0] is False
+        assert is_url_in_scope("https://target.test.co/api", "target.test")[0] is False
+
+        # Userinfo credentials in URL
+        assert is_url_in_scope("https://user:pass@target.test/api", "target.test")[0] is False
+        assert is_url_in_scope("https://admin@target.test/api", "target.test")[0] is False
+
+        # Unsupported / dangerous schemes
+        assert is_url_in_scope("javascript:alert(1)", "target.test")[0] is False
+        assert is_url_in_scope("file:///etc/passwd", "target.test")[0] is False
+        assert is_url_in_scope("data:text/html,<html>", "target.test")[0] is False
+        assert is_url_in_scope("mailto:admin@target.test", "target.test")[0] is False
+
+        # Empty / non-string / malformed
+        assert is_url_in_scope("", "target.test")[0] is False
+        assert is_url_in_scope(None, "target.test")[0] is False
+        assert is_url_in_scope("   ", "target.test")[0] is False
 
 
 # ---------------------------------------------------------------------------

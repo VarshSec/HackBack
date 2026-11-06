@@ -1,6 +1,7 @@
 """
 Unit tests for BOLA core extraction models, route normalizer, and resource detector.
 """
+import json
 import pytest
 from tasks.bola.models import (
     CandidateEndpoint,
@@ -21,6 +22,184 @@ from tasks.bola.resource_detector import (
     extract_json_parameters,
     extract_query_parameters,
 )
+from tasks.bola.sanitizer import (
+    sanitize_url,
+    sanitize_snippet,
+    sanitize_sample_value,
+    sanitize_schema_dict,
+)
+
+
+class TestSecretLeakageWithCanaries:
+    """
+    Exhaustive regression test suite verifying that secrets and credentials
+    never leak across URL sanitization, evidence snippets, query strings,
+    parameter extraction, response schemas, and dictionary serialization.
+    """
+    CANARY_PASSWORD = "CANARY_PASSWORD_998877_SECRET"
+    CANARY_AUTH_TOKEN = "CANARY_AUTH_TOKEN_AABBCC_SECRET"
+    CANARY_COOKIE = "CANARY_COOKIE_SESSION_112233_SECRET"
+    CANARY_USERINFO_PASS = "CANARY_USERINFO_SECRET_4455"
+    CANARY_API_KEY = "CANARY_API_KEY_XYZ_9999_SECRET"
+
+    def test_url_with_userinfo_and_sensitive_query(self):
+        url = (
+            f"https://admin:{self.CANARY_USERINFO_PASS}@target.test/api/v1/users"
+            f"?token={self.CANARY_AUTH_TOKEN}&apikey={self.CANARY_API_KEY}&name=alice&status=active"
+        )
+        endpoint = CandidateEndpoint(
+            candidate_id="cand-test-01",
+            scan_id="scan-01",
+            target_domain="target.test",
+            method="GET",
+            original_url=url,
+            route_template="/api/v1/users",
+            resource_type="users",
+        )
+
+        # 1. Userinfo must be stripped completely
+        assert self.CANARY_USERINFO_PASS not in endpoint.original_url
+        assert "admin:" not in endpoint.original_url
+        assert "@target.test" not in endpoint.original_url
+
+        # 2. Sensitive query values must be redacted to [REDACTED]
+        assert self.CANARY_AUTH_TOKEN not in endpoint.original_url
+        assert self.CANARY_API_KEY not in endpoint.original_url
+        assert "token=%5BREDACTED%5D" in endpoint.original_url or "token=[REDACTED]" in endpoint.original_url
+        assert "apikey=%5BREDACTED%5D" in endpoint.original_url or "apikey=[REDACTED]" in endpoint.original_url
+
+        # 3. Non-sensitive query parameters must be preserved
+        assert "name=alice" in endpoint.original_url
+        assert "status=active" in endpoint.original_url
+
+        # 4. JSON serialization roundtrip must not leak canaries
+        dumped = json.dumps(endpoint.to_dict())
+        assert self.CANARY_USERINFO_PASS not in dumped
+        assert self.CANARY_AUTH_TOKEN not in dumped
+        assert self.CANARY_API_KEY not in dumped
+
+    def test_evidence_record_snippet_and_location_redaction(self):
+        location = f"https://admin:{self.CANARY_USERINFO_PASS}@target.test/api/v1/login"
+        snippet = (
+            f"POST /api/v1/login HTTP/1.1\r\n"
+            f"Host: target.test\r\n"
+            f"Authorization: Bearer {self.CANARY_AUTH_TOKEN}\r\n"
+            f"Cookie: session={self.CANARY_COOKIE}; theme=dark\r\n"
+            f"Content-Type: application/json\r\n\r\n"
+            f'{{"username": "admin", "password": "{self.CANARY_PASSWORD}", "client_secret": "{self.CANARY_API_KEY}"}}'
+        )
+
+        ev = EvidenceRecord(
+            source="traffic",
+            parser="TrafficObserver",
+            location=location,
+            snippet=snippet,
+            confidence_signals=["live_traffic"],
+        )
+
+        # Location must have userinfo stripped
+        assert self.CANARY_USERINFO_PASS not in ev.location
+        assert "admin:" not in ev.location
+
+        # Snippet must have secrets replaced with [REDACTED]
+        assert self.CANARY_AUTH_TOKEN not in ev.snippet
+        assert self.CANARY_COOKIE not in ev.snippet
+        assert self.CANARY_PASSWORD not in ev.snippet
+        assert self.CANARY_API_KEY not in ev.snippet
+
+        # Non-sensitive keys and values must remain intact
+        assert "username" in ev.snippet
+        assert "admin" in ev.snippet
+        assert "theme=dark" in ev.snippet
+        assert "Authorization: [REDACTED]" in ev.snippet
+
+        dumped = json.dumps(ev.to_dict())
+        assert self.CANARY_USERINFO_PASS not in dumped
+        assert self.CANARY_AUTH_TOKEN not in dumped
+        assert self.CANARY_COOKIE not in dumped
+        assert self.CANARY_PASSWORD not in dumped
+
+    def test_candidate_parameter_sample_value_and_nested_json(self):
+        param = CandidateParameter(
+            name="client_secret",
+            location=ParameterLocation.BODY_JSON,
+            sample_value=self.CANARY_API_KEY,
+        )
+        assert param.is_redacted is True
+        assert param.sample_value == "[REDACTED]"
+        assert self.CANARY_API_KEY not in (param.sample_value or "")
+
+        # Test nested JSON extraction
+        nested_body = {
+            "auth": {
+                "password": self.CANARY_PASSWORD,
+                "token": self.CANARY_AUTH_TOKEN,
+            },
+            "user": {
+                "id": 1234,
+                "email": "test@target.test",
+            }
+        }
+        params = extract_json_parameters(nested_body)
+        for p in params:
+            val_str = str(p.sample_value) if p.sample_value is not None else ""
+            assert self.CANARY_PASSWORD not in val_str
+            assert self.CANARY_AUTH_TOKEN not in val_str
+            if "password" in p.name or "token" in p.name:
+                assert p.is_redacted is True
+                assert p.sample_value == "[REDACTED]"
+
+    def test_response_schema_redaction(self):
+        schema = {
+            "type": "object",
+            "properties": {
+                "id": {"type": "integer"},
+                "password_hash": {"type": "string", "example": self.CANARY_PASSWORD},
+                "api_key": {"type": "string", "default": self.CANARY_API_KEY},
+            }
+        }
+        endpoint = CandidateEndpoint(
+            candidate_id="cand-schema-01",
+            scan_id="scan-01",
+            target_domain="target.test",
+            method="GET",
+            original_url="/api/users/1",
+            route_template="/api/users/{id}",
+            resource_type="users",
+            response_schema=schema,
+        )
+        schema_str = json.dumps(endpoint.response_schema)
+        assert self.CANARY_PASSWORD not in schema_str
+        assert self.CANARY_API_KEY not in schema_str
+        assert "[REDACTED]" in schema_str
+
+    def test_authentication_context_validation(self):
+        # Valid contexts
+        for valid_ctx in ("primary", "secondary", "anonymous", None):
+            ep = CandidateEndpoint(
+                candidate_id="cand-ctx",
+                scan_id="s1",
+                target_domain="target.test",
+                method="GET",
+                original_url="/api/test",
+                route_template="/api/test",
+                resource_type="test",
+                authentication_context=valid_ctx,
+            )
+            assert ep.authentication_context == valid_ctx
+
+        # Invalid context safely normalizes to anonymous (never stores raw credential)
+        ep_bad = CandidateEndpoint(
+            candidate_id="cand-ctx-bad",
+            scan_id="s1",
+            target_domain="target.test",
+            method="GET",
+            original_url="/api/test",
+            route_template="/api/test",
+            resource_type="test",
+            authentication_context="superadmin_secret_token",
+        )
+        assert ep_bad.authentication_context == "anonymous"
 
 
 class TestCandidateModelsAndRedaction:

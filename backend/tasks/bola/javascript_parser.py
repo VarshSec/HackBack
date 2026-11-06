@@ -25,6 +25,7 @@ from tasks.bola.resource_detector import (
     detect_identifier_type,
     extract_query_parameters,
 )
+from tasks.bola.scope import is_url_in_scope
 
 # Common static asset extensions to ignore
 _IGNORED_EXTENSIONS = (
@@ -170,6 +171,11 @@ class JavaScriptParser:
 
         # 6. Static API string pattern scanner (fallback heuristic)
         for match in _API_STRING_RE.finditer(self.js_code):
+            end_pos = match.end()
+            # If immediately followed by '+' string concatenation, it's an incomplete prefix
+            remaining = self.js_code[end_pos:end_pos + 10].lstrip()
+            if remaining.startswith("+"):
+                continue
             raw_url = match.group(1)
             # Default to GET for raw string literals unless already discovered
             self._process_match(
@@ -195,12 +201,23 @@ class JavaScriptParser:
         if not _is_valid_api_candidate(cleaned_url):
             return
 
-        parsed = urllib.parse.urlsplit(cleaned_url)
+        if target_domain:
+            in_scope, resolved = is_url_in_scope(cleaned_url, target_domain)
+            if not in_scope or not resolved:
+                return
+            parsed = urllib.parse.urlsplit(resolved)
+        else:
+            parsed = urllib.parse.urlsplit(cleaned_url)
+
         path = parsed.path
         if not path.startswith("/"):
             path = "/" + path
 
         norm_template, resource_type, path_params = normalize_url_path(path)
+        # Avoid creating duplicate or spurious GET candidates for routes already extracted by explicit HTTP clients
+        if call_type == "api_string_literal" and any(tpl == norm_template for (m, tpl) in seen_keys):
+            return
+
         key = (method, norm_template)
         if key in seen_keys:
             return

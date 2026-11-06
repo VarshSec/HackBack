@@ -428,9 +428,21 @@ def _merge_retry_results(retry_results: list, scan_id: str, domain: str,
 def _extract_bola_candidates(scan_id: str, domain: str, results: list) -> dict:
     """
     Extracts candidate endpoints and resource models from scan observations
-    (Katana crawled endpoints, FFUF paths, OWASP discovered endpoints) using
-    the P2.3 extraction pipeline.
-    Completely isolated: never raises or affects existing module execution.
+    using the P2.3 candidate extraction pipeline.
+
+    Integration Architecture & Boundaries:
+    1. Live Scan Integration (Automated):
+       - Katana crawled endpoints (from webscan module)
+       - FFUF enumerated paths and methods (from enumeration module)
+       - OWASP crawled URLs (from owasp module)
+    2. Standalone Adapters (Programmatic / Targeted Profiles):
+       - OpenAPI specifications, raw JavaScript bundles, and static HTML files
+         are handled via dedicated standalone adapters (OpenAPIParser, JavaScriptParser,
+         HTMLPageParser) in targeted scans or API-first assessments.
+    3. Failure Isolation:
+       - Extraction is completely isolated and wrapped in defensive exception handling;
+         any extraction or parsing anomaly is logged as a warning, and empty candidate
+         inventory is returned so `_finalize()` proceeds without disruption.
     """
     try:
         from tasks.bola.endpoint_extractor import EndpointExtractorPipeline

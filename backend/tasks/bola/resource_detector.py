@@ -16,6 +16,7 @@ from tasks.bola.models import (
     ParameterLocation,
     SemanticRole,
 )
+from tasks.bola.sanitizer import is_sensitive_key
 
 # Standard UUID: 8-4-4-4-12 hexadecimal
 _UUID_RE = re.compile(
@@ -102,7 +103,7 @@ def classify_semantic_role(
     """
     p_name = param_name.strip().lower()
 
-    if p_name in _SESSION_TOKEN_NAMES or any(tok in p_name for tok in ("token", "secret", "csrf", "pass")):
+    if is_sensitive_key(p_name) or p_name in _SESSION_TOKEN_NAMES:
         return SemanticRole.SESSION_TOKEN
 
     if p_name in _ACTION_FLAG_NAMES:

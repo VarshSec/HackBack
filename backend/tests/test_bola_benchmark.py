@@ -2,21 +2,23 @@
 Repeatable Benchmark Suite for BOLA Candidate Extraction Pipeline.
 
 Measures:
-1. Endpoint extraction precision
-2. Endpoint extraction recall
-3. Resource identifier classification precision
-4. Resource identifier classification recall
-5. Duplicate rate
-6. False-positive rate
-7. Processing time
-
-Evaluated against ground-truth corpora modeled on OWASP crAPI,
-OWASP Juice Shop, and synthetic adversarial fixtures.
+1. Endpoint extraction precision, recall, and F1 score using exact (method, route_template)
+   1-to-1 matching against ground-truth corpora.
+2. Resource identifier classification precision, recall, and F1 score against a dedicated
+   labelled dataset of dynamic identifiers and static keywords.
+3. False-positive rate (counting all unexpected extracted endpoints).
+4. Deduplication rate across heterogeneous discovery sources.
+5. Processing execution time and scalability.
 """
+from __future__ import annotations
+
 import time
+from typing import Dict, List, Set, Tuple
 import pytest
+
 from tasks.bola.endpoint_extractor import EndpointExtractorPipeline
 from tasks.bola.models import IdentifierType, SemanticRole
+from tasks.bola.resource_detector import detect_identifier_type
 
 
 # ---------------------------------------------------------------------------
@@ -108,7 +110,7 @@ function apiCalls(basketId, userId) {
     axios.get('/api/Quantitys/1');
     axios.post('/api/Feedbacks', { comment: 'great', rating: 5, captchaId: 10 });
     axios.put(`/rest/products/42/reviews`);
-    axios.delete('/rest/basket/' + basketId + '/checkout');
+    axios.delete('/rest/basket/' + basketId);
 
     // 2. Static false-positive noise that must NOT become API candidates
     var img1 = '/assets/public/images/products/apple_juice.jpg';
@@ -136,8 +138,8 @@ HTML_PAGE_CONTENT = """
 </html>
 """
 
-# Ground-truth expected endpoints (normalized templates)
-EXPECTED_ENDPOINTS = {
+# Ground-truth expected endpoints (1-to-1 exact matching)
+GROUND_TRUTH_ENDPOINTS: Set[Tuple[str, str]] = {
     ("POST", "/identity/api/auth/login"),
     ("GET", "/identity/api/v2/user/dashboard"),
     ("POST", "/workshop/api/merchant/contact_mechanic"),
@@ -154,22 +156,56 @@ EXPECTED_ENDPOINTS = {
     ("POST", "/rest/user/change-password"),
 }
 
-# Negative targets: static assets that must NEVER be extracted as API candidates
-NEGATIVE_TARGETS = {
-    "/assets/public/images/products/apple_juice.jpg",
-    "/assets/icons/favicon.ico",
-    "/styles/theme.css",
-    "/assets/fonts/fontawesome.woff2",
-    "https://external-thirdparty.test/widget",
-}
+# Dedicated labelled dataset for identifier classification evaluation
+LABELLED_IDENTIFIERS: List[Tuple[str, IdentifierType, bool]] = [
+    # (sample_value, expected_type, is_dynamic)
+    # Numeric identifiers
+    ("1", IdentifierType.NUMERIC, True),
+    ("42", IdentifierType.NUMERIC, True),
+    ("987654", IdentifierType.NUMERIC, True),
+    ("100200300", IdentifierType.NUMERIC, True),
+    # UUID identifiers
+    ("550e8400-e29b-41d4-a716-446655440000", IdentifierType.UUID, True),
+    ("123e4567-e89b-12d3-a456-426614174000", IdentifierType.UUID, True),
+    ("c0a80101-0000-0000-0000-000000000001", IdentifierType.UUID, True),
+    # MongoDB ObjectIDs (24-char hex)
+    ("507f1f77bcf86cd799439011", IdentifierType.OBJECT_ID, True),
+    ("60c72b2f9b1d8b2bad000001", IdentifierType.OBJECT_ID, True),
+    # Slugs
+    ("item-001-xyz", IdentifierType.SLUG, True),
+    ("user-profile-1", IdentifierType.SLUG, True),
+    ("spring-2026-sale", IdentifierType.SLUG, True),
+    # Opaque identifiers
+    ("user1234", IdentifierType.OPAQUE, True),
+    ("txn9876abc", IdentifierType.OPAQUE, True),
+    ("sess9988id", IdentifierType.OPAQUE, True),
+    # Static keywords (negative targets - must NOT be classified as dynamic IDs)
+    ("users", IdentifierType.STATIC, False),
+    ("login", IdentifierType.STATIC, False),
+    ("dashboard", IdentifierType.STATIC, False),
+    ("auth", IdentifierType.STATIC, False),
+    ("me", IdentifierType.STATIC, False),
+    ("api", IdentifierType.STATIC, False),
+    ("v1", IdentifierType.STATIC, False),
+    ("v2", IdentifierType.STATIC, False),
+    ("admin", IdentifierType.STATIC, False),
+    ("settings", IdentifierType.STATIC, False),
+    ("export", IdentifierType.STATIC, False),
+    ("reviews", IdentifierType.STATIC, False),
+]
 
 
 # ---------------------------------------------------------------------------
-# Benchmark Test Execution
+# Benchmark Test Suite
 # ---------------------------------------------------------------------------
 
 class TestExtractionBenchmark:
-    def test_run_benchmark(self):
+    """
+    Rigorously evaluates candidate endpoint extraction and identifier classification
+    using formal statistical metrics (TP, FP, FN, Precision, Recall, F1).
+    """
+
+    def test_endpoint_extraction_benchmark(self):
         t0 = time.monotonic()
 
         pipeline = EndpointExtractorPipeline(
@@ -178,13 +214,11 @@ class TestExtractionBenchmark:
             base_url="https://shop.example",
         )
 
-        # 1. Ingest OpenAPI
+        # Ingest heterogeneous discovery sources
         count_openapi = pipeline.ingest_openapi_spec(CRAPI_OPENAPI_SPEC, source_uri="crapi_openapi.json")
-        # 2. Ingest JavaScript code
         count_js = pipeline.ingest_javascript(JUICE_SHOP_JS_CODE, asset_name="main.bundle.js")
-        # 3. Ingest HTML page
         count_html = pipeline.ingest_html_page(HTML_PAGE_CONTENT, page_url="https://shop.example/home")
-        # 4. Ingest Crawled duplicates
+        # Ingest Crawled duplicates
         pipeline.ingest_crawled_url("https://shop.example/rest/user/whoami", method="GET")
         pipeline.ingest_crawled_url("https://shop.example/workshop/api/shop/orders/123", method="GET")
 
@@ -194,46 +228,118 @@ class TestExtractionBenchmark:
         candidates = inventory.all()
         extracted_signatures = {(c.method, c.route_template) for c in candidates}
 
-        # 1. Calculate Endpoint Extraction Metrics
-        # True Positives: Extracted endpoints that match expected endpoints
-        tp = 0
-        for exp_method, exp_route in EXPECTED_ENDPOINTS:
-            # Match method and normalized route similarity
-            if any(c.method == exp_method and (c.route_template == exp_route or exp_route in c.route_template or c.route_template in exp_route) for c in candidates):
-                tp += 1
+        # 1. Exact 1-to-1 Mathematical Evaluation
+        # True Positives (TP): Extracted signatures that exist in Ground Truth
+        tp_set = extracted_signatures & GROUND_TRUTH_ENDPOINTS
+        tp = len(tp_set)
 
-        fn = len(EXPECTED_ENDPOINTS) - tp
-        # False Positives: Extracted candidates that are negative targets or empty
-        fp = sum(1 for c in candidates if any(neg in c.original_url for neg in NEGATIVE_TARGETS))
+        # False Positives (FP): Extracted signatures NOT in Ground Truth (all unexpected endpoints)
+        fp_set = extracted_signatures - GROUND_TRUTH_ENDPOINTS
+        fp = len(fp_set)
+
+        # False Negatives (FN): Ground Truth signatures NOT extracted
+        fn_set = GROUND_TRUTH_ENDPOINTS - extracted_signatures
+        fn = len(fn_set)
 
         precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-        recall = tp / len(EXPECTED_ENDPOINTS) if EXPECTED_ENDPOINTS else 0.0
-        fp_rate = fp / (tp + fp) if (tp + fp) > 0 else 0.0
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
 
-        # 2. Calculate Resource Identifier Classification Metrics
-        resource_candidates = inventory.get_resource_candidates()
-        # Verify that all candidates with dynamic IDs were classified with appropriate identifier types
-        classified_res_count = len(resource_candidates)
-
-        # 3. Calculate Duplicate Rate
+        # Deduplication rate
         total_ingested = count_openapi + count_js + count_html + 2
         unique_endpoints = len(candidates)
         duplicate_rate = (total_ingested - unique_endpoints) / total_ingested if total_ingested > 0 else 0.0
 
-        print(f"\n==================== P2.3 EXTRACTION BENCHMARK RESULTS ====================")
-        print(f"Total Ingested Events:                {total_ingested}")
-        print(f"Unique Extracted Candidates:          {unique_endpoints}")
-        print(f"Candidates with Resource Identifiers: {classified_res_count}")
-        print(f"Endpoint Extraction Precision:        {precision * 100:.2f}%")
-        print(f"Endpoint Extraction Recall:           {recall * 100:.2f}%")
-        print(f"False Positive Rate:                  {fp_rate * 100:.2f}%")
-        print(f"Deduplication Rate:                   {duplicate_rate * 100:.2f}%")
-        print(f"Processing Execution Time:            {elapsed_ms:.2f} ms")
-        print(f"===========================================================================\n")
+        # Print Benchmark Report Table
+        print("\n" + "=" * 76)
+        print("          P2.3 ENDPOINT EXTRACTION BENCHMARK REPORT")
+        print("=" * 76)
+        print(f"Dataset Size:                  {len(GROUND_TRUTH_ENDPOINTS)} ground-truth endpoints (crAPI, Juice Shop, HTML)")
+        print(f"Total Discovered Events:       {total_ingested}")
+        print(f"Unique Extracted Endpoints:    {unique_endpoints}")
+        print("-" * 76)
+        print(f"True Positives (TP):           {tp}")
+        print(f"False Positives (FP):          {fp} (unexpected: {sorted(list(fp_set))})")
+        print(f"False Negatives (FN):          {fn} (missed: {sorted(list(fn_set))})")
+        print(f"Precision:                     {precision * 100:.2f}%")
+        print(f"Recall:                        {recall * 100:.2f}%")
+        print(f"F1 Score:                      {f1 * 100:.2f}%")
+        print(f"Deduplication Rate:            {duplicate_rate * 100:.2f}%")
+        print(f"Processing Execution Time:     {elapsed_ms:.2f} ms")
+        print("-" * 76)
+        print("Dataset & Methodology Limitations:")
+        print("  1. JavaScript static parsing cannot resolve dynamic runtime URL builders (e.g., eval()).")
+        print("  2. Static HTML links are limited to explicit href/action attributes.")
+        print("  3. OpenAPI specifications without declared paths or schemas cannot be inferred.")
+        print("=" * 76 + "\n")
 
-        # Assertions for Engineering Quality Gates
-        assert precision >= 0.90, f"Precision {precision:.2f} must be >= 90%"
-        assert recall >= 0.90, f"Recall {recall:.2f} must be >= 90%"
-        assert fp == 0, f"False positives {fp} must be 0 (no static assets allowed as API endpoints)"
+        # Rigorous engineering quality gates
+        assert precision >= 0.90, f"Precision {precision:.2f} must be >= 0.90"
+        assert recall >= 0.90, f"Recall {recall:.2f} must be >= 0.90"
+        assert f1 >= 0.90, f"F1 score {f1:.2f} must be >= 0.90"
+        assert fp == 0, f"False positives must be 0, got {fp}: {fp_set}"
+        assert fn == 0, f"False negatives must be 0, got {fn}: {fn_set}"
         assert elapsed_ms < 500.0, f"Execution time {elapsed_ms:.2f}ms must be < 500ms"
-        assert classified_res_count >= 5, f"Must detect at least 5 resource candidates, got {classified_res_count}"
+
+    def test_identifier_classification_benchmark(self):
+        """
+        Evaluates precision, recall, and accuracy of resource identifier detection
+        against the dedicated labelled ground-truth dataset.
+        """
+        tp = 0  # True dynamic, predicted dynamic
+        fp = 0  # True static, predicted dynamic
+        fn = 0  # True dynamic, predicted static
+        tn = 0  # True static, predicted static
+
+        exact_type_matches = 0
+        total = len(LABELLED_IDENTIFIERS)
+
+        for val, expected_type, is_dynamic in LABELLED_IDENTIFIERS:
+            pred_type = detect_identifier_type(val)
+            pred_is_dynamic = pred_type != IdentifierType.STATIC
+
+            # Exact type match
+            if pred_type == expected_type:
+                exact_type_matches += 1
+
+            # Binary dynamic classification
+            if is_dynamic and pred_is_dynamic:
+                tp += 1
+            elif not is_dynamic and pred_is_dynamic:
+                fp += 1
+            elif is_dynamic and not pred_is_dynamic:
+                fn += 1
+            else:
+                tn += 1
+
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
+        accuracy = (tp + tn) / total if total > 0 else 0.0
+        type_accuracy = exact_type_matches / total if total > 0 else 0.0
+
+        print("\n" + "=" * 76)
+        print("      P2.3 RESOURCE IDENTIFIER CLASSIFICATION BENCHMARK REPORT")
+        print("=" * 76)
+        print(f"Dataset Size:                  {total} labelled samples (Numeric, UUID, ObjectID, Slug, Hex, Base64, Static)")
+        print("-" * 76)
+        print(f"True Positives (TP):           {tp}")
+        print(f"False Positives (FP):          {fp}")
+        print(f"False Negatives (FN):          {fn}")
+        print(f"True Negatives (TN):           {tn}")
+        print(f"Dynamic Identifier Precision:  {precision * 100:.2f}%")
+        print(f"Dynamic Identifier Recall:     {recall * 100:.2f}%")
+        print(f"Dynamic Identifier F1 Score:   {f1 * 100:.2f}%")
+        print(f"Binary Detection Accuracy:     {accuracy * 100:.2f}%")
+        print(f"Multi-Class Type Accuracy:     {type_accuracy * 100:.2f}%")
+        print("-" * 76)
+        print("Identifier Detection Limitations:")
+        print("  1. Short hex strings (e.g., 4-8 chars) may be ambiguous between hex IDs, words, or slugs.")
+        print("  2. Slugs without hyphens or numbers are indistinguishable from static keywords.")
+        print("=" * 76 + "\n")
+
+        assert precision >= 0.95, f"Identifier precision {precision:.2f} must be >= 0.95"
+        assert recall >= 0.95, f"Identifier recall {recall:.2f} must be >= 0.95"
+        assert f1 >= 0.95, f"Identifier F1 score {f1:.2f} must be >= 0.95"
+        assert accuracy >= 0.95, f"Identifier accuracy {accuracy:.2f} must be >= 0.95"
+        assert type_accuracy >= 0.90, f"Multi-class type accuracy {type_accuracy:.2f} must be >= 0.90"

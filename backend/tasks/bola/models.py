@@ -2,22 +2,22 @@
 Candidate endpoint and resource models for BOLA / IDOR extraction pipeline.
 
 Defines structured schemas for parameters, evidence records, candidate endpoints,
-and classification enumerations.
+and classification enumerations. Enforces strict secret redaction across all fields.
 """
 from __future__ import annotations
 
 import enum
 import hashlib
-import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-
-_SENSITIVE_KEY_RE = re.compile(
-    r"(password|passwd|pwd|secret|token|access_token|refresh_token|"
-    r"api[_-]?key|auth|authorization|bearer|cookie|session|session[_-]?id|ssn|credit[_-]?card|cvv|csrf|xsrf)",
-    re.IGNORECASE,
+from tasks.bola.sanitizer import (
+    sanitize_url,
+    sanitize_snippet,
+    sanitize_sample_value,
+    sanitize_schema_dict,
+    is_sensitive_key,
 )
 
 
@@ -73,13 +73,19 @@ class CandidateParameter(BaseModel):
 
     @model_validator(mode="after")
     def redact_secrets(self) -> CandidateParameter:
-        if _SENSITIVE_KEY_RE.search(self.name):
+        sanitized_val, redacted = sanitize_sample_value(self.name, self.sample_value)
+        if redacted:
             self.is_redacted = True
-            if self.sample_value is not None:
-                self.sample_value = "[REDACTED]"
+            self.sample_value = sanitized_val or "[REDACTED]"
             if self.semantic_role == SemanticRole.UNCLASSIFIED:
                 self.semantic_role = SemanticRole.SESSION_TOKEN
+        elif self.sample_value is not None:
+            self.sample_value = str(sanitized_val)
         return self
+
+
+    def to_dict(self) -> Dict[str, Any]:
+        return self.model_dump(mode="json")
 
 
 class EvidenceRecord(BaseModel):
@@ -91,15 +97,23 @@ class EvidenceRecord(BaseModel):
     extracted_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     confidence_signals: List[str] = Field(default_factory=list)
 
+    @field_validator("location")
+    @classmethod
+    def sanitize_evidence_location(cls, v: str) -> str:
+        if not v:
+            return ""
+        # If location contains a URL or query string, sanitize credentials
+        if "://" in v or "?" in v:
+            return sanitize_url(v)
+        return v
+
     @field_validator("snippet")
     @classmethod
-    def sanitize_snippet(cls, v: Optional[str]) -> Optional[str]:
-        if v is None:
-            return None
-        # Redact raw tokens or passwords appearing in evidence snippets
-        redacted = _SENSITIVE_KEY_RE.sub("[REDACTED]", v)
-        # Bounded length for storage efficiency
-        return redacted[:500]
+    def sanitize_evidence_snippet(cls, v: Optional[str]) -> Optional[str]:
+        return sanitize_snippet(v)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return self.model_dump(mode="json")
 
 
 class CandidateEndpoint(BaseModel):
@@ -123,6 +137,29 @@ class CandidateEndpoint(BaseModel):
     first_seen: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     last_seen: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
+    @field_validator("original_url")
+    @classmethod
+    def sanitize_original_url(cls, v: str) -> str:
+        return sanitize_url(v)
+
+    @field_validator("authentication_context")
+    @classmethod
+    def validate_auth_context(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        valid_contexts = {"primary", "secondary", "anonymous"}
+        if v not in valid_contexts:
+            # Never allow raw tokens or credentials to be stored as auth context
+            return "anonymous"
+        return v
+
+    @field_validator("response_schema")
+    @classmethod
+    def sanitize_response_schema(cls, v: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if v is None:
+            return None
+        return sanitize_schema_dict(v)
+
     @classmethod
     def generate_candidate_id(cls, method: str, route_template: str, target_domain: str = "") -> str:
         """Deterministic stable candidate identifier."""
@@ -140,3 +177,6 @@ class CandidateEndpoint(BaseModel):
         self.evidence.append(ev)
         self.add_source(ev.source)
         self.last_seen = datetime.now(timezone.utc)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return self.model_dump(mode="json")

@@ -25,6 +25,7 @@ from tasks.bola.resource_detector import (
     detect_identifier_type,
     extract_query_parameters,
 )
+from tasks.bola.scope import is_url_in_scope
 
 
 class _HTMLFormExtractor(HTMLParser):
@@ -86,17 +87,8 @@ class HTMLPageParser:
         """
         Ensures the URL belongs to the target domain scope and returns the normalized path.
         """
-        resolved = urllib.parse.urljoin(self.page_url, url)
-        parsed = urllib.parse.urlsplit(resolved)
-
-        if parsed.scheme not in ("http", "https", ""):
-            return False, ""
-
-        host = (parsed.hostname or "").lower()
-        if host and host != self.target_domain and not host.endswith(f".{self.target_domain}"):
-            return False, ""
-
-        return True, resolved
+        in_scope, resolved = is_url_in_scope(url, self.target_domain, base_url=self.page_url)
+        return in_scope, (resolved or "")
 
     def extract_candidates(self, scan_id: str = "") -> List[CandidateEndpoint]:
         candidates: List[CandidateEndpoint] = []
@@ -113,10 +105,10 @@ class HTMLPageParser:
 
         # 1. Process HTML Forms
         for form in extractor.forms:
-            action = form["action"]
+            action = form["action"] or self.page_url
             method = form["method"]
             in_scope, full_url = self._is_in_scope(action)
-            if not in_scope:
+            if not in_scope or not full_url:
                 continue
 
             parsed = urllib.parse.urlsplit(full_url)
@@ -174,7 +166,7 @@ class HTMLPageParser:
         # 2. Process HTML Links
         for link in extractor.links:
             in_scope, full_url = self._is_in_scope(link)
-            if not in_scope:
+            if not in_scope or not full_url:
                 continue
 
             parsed = urllib.parse.urlsplit(full_url)
