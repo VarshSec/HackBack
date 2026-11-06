@@ -638,6 +638,14 @@ def get_findings(scan_id: UUID, http_request: Request, db: Session = Depends(get
     )
 
 
+@router.get("/scan/{scan_id}/candidates")
+def get_scan_candidates(scan_id: UUID, http_request: Request, db: Session = Depends(get_db)):
+    """Return discovered BOLA/IDOR candidate endpoints and resource models (P2.3)."""
+    scan = get_owned_scan_or_404(scan_id, http_request, db)
+    raw = scan.raw_findings or {}
+    return raw.get("bola_candidates", {"total_candidates": 0, "candidates": []})
+
+
 @router.get("/health")
 def health():
     return {"status": "ok"}

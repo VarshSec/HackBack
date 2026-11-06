@@ -425,6 +425,54 @@ def _merge_retry_results(retry_results: list, scan_id: str, domain: str,
     _finalize(merged, scan_id, domain)
 
 
+def _extract_bola_candidates(scan_id: str, domain: str, results: list) -> dict:
+    """
+    Extracts candidate endpoints and resource models from scan observations
+    (Katana crawled endpoints, FFUF paths, OWASP discovered endpoints) using
+    the P2.3 extraction pipeline.
+    Completely isolated: never raises or affects existing module execution.
+    """
+    try:
+        from tasks.bola.endpoint_extractor import EndpointExtractorPipeline
+        pipeline = EndpointExtractorPipeline(scan_id=scan_id, target_domain=domain)
+
+        for r in results:
+            if not isinstance(r, dict):
+                continue
+            module_name = r.get("module")
+            findings = r.get("findings") or []
+
+            for f in findings:
+                if not isinstance(f, dict):
+                    continue
+                # Katana endpoints
+                if module_name == "webscan" and f.get("tool") == "katana":
+                    endpoint = f.get("endpoint") or f.get("target")
+                    if endpoint:
+                        pipeline.ingest_crawled_url(str(endpoint), method="GET", source="katana")
+
+                # FFUF enumeration paths
+                elif module_name == "enumeration" and f.get("tool") == "ffuf":
+                    evidence = f.get("evidence", "")
+                    if " -> " in evidence:
+                        req_part = evidence.split(" -> ")[0].strip()
+                        parts = req_part.split(" ", 1)
+                        if len(parts) == 2:
+                            method, url = parts
+                            pipeline.ingest_crawled_url(url, method=method, source="ffuf")
+
+                # OWASP crawler URLs
+                elif module_name == "owasp":
+                    url = f.get("target") or f.get("url")
+                    if url and isinstance(url, str) and url.startswith("http"):
+                        pipeline.ingest_crawled_url(url, method="GET", source="owasp_crawl")
+
+        return pipeline.get_inventory().to_dict()
+    except Exception as e:
+        logger.warning("_extract_bola_candidates failed for scan %s: %s", scan_id, e)
+        return {"total_candidates": 0, "candidates": []}
+
+
 def _finalize(results: list, scan_id: str, domain: str) -> None:
     """
     Aggregate -> deterministic score -> AI description -> PDF -> complete.
@@ -454,6 +502,11 @@ def _finalize(results: list, scan_id: str, domain: str) -> None:
             if persisted:
                 aggregated['interim_results'] = persisted
             scan.raw_findings = aggregated
+            try:
+                aggregated['bola_candidates'] = _extract_bola_candidates(scan_id, domain, results)
+                scan.raw_findings = aggregated
+            except Exception as e:
+                logger.warning("BOLA candidate extraction skipped for scan %s: %s", scan_id, e)
             db.commit()
         except Exception as e:
             logger.error("Aggregation failed for scan %s: %s", scan_id, e)
