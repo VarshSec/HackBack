@@ -301,6 +301,97 @@ class TestURLScopeEnforcement:
         assert is_url_in_scope(None, "target.test")[0] is False
         assert is_url_in_scope("   ", "target.test")[0] is False
 
+    def test_unrelated_external_domains_in_allowlist_are_rejected(self):
+        """
+        Verifies that passing unrelated external domains or lookalikes in allowed_subdomains
+        never authorizes them. Only genuine subdomains of target_domain can be authorized.
+        """
+        malicious_allowlist = [
+            "attacker.test",
+            "target.test.attacker.test",
+            "nottarget.test",
+            "evil.com",
+            "api.target.test",      # genuine subdomain
+            "staging.target.test",  # genuine subdomain
+        ]
+
+        # 1. Genuine subdomains on the allowlist are accepted
+        in_scope, res = is_url_in_scope(
+            "https://api.target.test/v1", "target.test", allowed_subdomains=malicious_allowlist
+        )
+        assert in_scope is True
+        assert res == "https://api.target.test/v1"
+
+        in_scope, res = is_url_in_scope(
+            "https://staging.target.test/v1", "target.test", allowed_subdomains=malicious_allowlist
+        )
+        assert in_scope is True
+        assert res == "https://staging.target.test/v1"
+
+        # 2. Unrelated external domains in the allowlist MUST be rejected
+        assert is_url_in_scope(
+            "https://attacker.test/api", "target.test", allowed_subdomains=malicious_allowlist
+        )[0] is False
+        assert is_url_in_scope(
+            "https://evil.com/api", "target.test", allowed_subdomains=malicious_allowlist
+        )[0] is False
+
+        # 3. Lookalike suffix domains in the allowlist MUST be rejected
+        assert is_url_in_scope(
+            "https://target.test.attacker.test/api", "target.test", allowed_subdomains=malicious_allowlist
+        )[0] is False
+        assert is_url_in_scope(
+            "https://nottarget.test/api", "target.test", allowed_subdomains=malicious_allowlist
+        )[0] is False
+
+    def test_malformed_urls_fail_closed_without_raising(self):
+        """
+        Verifies that any malformed, unparseable, or invalid IPv6 URL fails closed
+        by returning (False, None) instead of propagating exceptions.
+        """
+        malformed_inputs = [
+            "http://[invalid:ipv6/path",
+            "http://[::1/path",
+            "http://[:1]",
+            "http://[2001:db8::1:80/path",
+            "http://target.test\x00/api",
+            "http://\x00target.test/api",
+            "http://:80",
+            "http://?query=1",
+            "https:///",
+            "http://[",
+            "http://]",
+        ]
+
+        for bad_url in malformed_inputs:
+            # Must return (False, None) and NEVER raise ValueError or other exceptions
+            in_scope, res = is_url_in_scope(bad_url, "target.test")
+            assert in_scope is False
+            assert res is None
+
+        # Malformed base URLs
+        malformed_bases = [
+            "http://[invalid:ipv6",
+            "http://[::1/path",
+            "http://target.test\x00",
+        ]
+        for bad_base in malformed_bases:
+            in_scope, res = is_url_in_scope("/api/v1/orders", "target.test", base_url=bad_base)
+            assert in_scope is False
+            assert res is None
+
+        # Malformed target domains
+        for bad_target in ("http://[invalid:ipv6", "target.test\x00", "", None):
+            in_scope, res = is_url_in_scope("https://target.test/api", bad_target)
+            assert in_scope is False
+            assert res is None
+
+        # Malformed allowlist entries do not crash or authorize
+        bad_allowlist = ["http://[invalid:ipv6", "@api.target.test", "api.target.test\x00"]
+        in_scope, res = is_url_in_scope("https://target.test/api", "target.test", allowed_subdomains=bad_allowlist)
+        assert in_scope is True  # Target host itself still works
+        assert res == "https://target.test/api"
+
 
 # ---------------------------------------------------------------------------
 # JavaScript Tests
