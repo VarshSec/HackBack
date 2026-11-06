@@ -51,17 +51,29 @@ class EndpointExtractorPipeline:
     and evidence tracking.
     """
 
-    def __init__(self, scan_id: str, target_domain: str, base_url: str = ""):
+    def __init__(
+        self,
+        scan_id: str,
+        target_domain: str,
+        base_url: str = "",
+        allowed_subdomains: Optional[Any] = None,
+    ):
         self.scan_id = scan_id
         self.target_domain = target_domain.strip().lower()
         self.base_url = base_url or f"https://{self.target_domain}"
+        self.allowed_subdomains = list(allowed_subdomains) if allowed_subdomains else []
         self.store = CandidateStore(scan_id=scan_id, target_domain=self.target_domain)
 
     def ingest_openapi_spec(self, raw_spec: str | Dict[str, Any], source_uri: str = "openapi.json") -> int:
         """Parses and ingests an OpenAPI/Swagger specification."""
         try:
             if source_uri.startswith(("http://", "https://")):
-                in_scope, _ = is_url_in_scope(source_uri, self.target_domain, base_url=self.base_url)
+                in_scope, _ = is_url_in_scope(
+                    source_uri,
+                    self.target_domain,
+                    base_url=self.base_url,
+                    allowed_subdomains=self.allowed_subdomains,
+                )
                 if not in_scope:
                     logger.warning("EndpointExtractor: OpenAPI source_uri out of scope: %s", source_uri)
                     return 0
@@ -78,7 +90,11 @@ class EndpointExtractorPipeline:
         """Statically extracts endpoints from JavaScript code."""
         try:
             parser = JavaScriptParser(js_code, asset_name=asset_name)
-            candidates = parser.extract_candidates(scan_id=self.scan_id, target_domain=self.target_domain)
+            candidates = parser.extract_candidates(
+                scan_id=self.scan_id,
+                target_domain=self.target_domain,
+                allowed_subdomains=self.allowed_subdomains,
+            )
             self.store.add_all(candidates)
             return len(candidates)
         except Exception as e:
@@ -88,7 +104,12 @@ class EndpointExtractorPipeline:
     def ingest_html_page(self, html_text: str, page_url: str) -> int:
         """Extracts endpoints from HTML links and forms."""
         try:
-            parser = HTMLPageParser(html_text, page_url=page_url, target_domain=self.target_domain)
+            parser = HTMLPageParser(
+                html_text,
+                page_url=page_url,
+                target_domain=self.target_domain,
+                allowed_subdomains=self.allowed_subdomains,
+            )
             candidates = parser.extract_candidates(scan_id=self.scan_id)
             self.store.add_all(candidates)
             return len(candidates)
@@ -99,7 +120,12 @@ class EndpointExtractorPipeline:
     def ingest_crawled_url(self, url: str, method: str = "GET", source: str = "katana") -> bool:
         """Ingests a single crawled URL (from Katana, FFUF, or web crawler)."""
         try:
-            in_scope, clean_url = is_url_in_scope(url, self.target_domain, base_url=self.base_url)
+            in_scope, clean_url = is_url_in_scope(
+                url,
+                self.target_domain,
+                base_url=self.base_url,
+                allowed_subdomains=self.allowed_subdomains,
+            )
             if not in_scope or not clean_url:
                 return False
 
@@ -151,7 +177,12 @@ class EndpointExtractorPipeline:
     ) -> bool:
         """Ingests an observed HTTP request/response transaction."""
         try:
-            in_scope, clean_url = is_url_in_scope(url, self.target_domain, base_url=self.base_url)
+            in_scope, clean_url = is_url_in_scope(
+                url,
+                self.target_domain,
+                base_url=self.base_url,
+                allowed_subdomains=self.allowed_subdomains,
+            )
             if not in_scope or not clean_url:
                 return False
 

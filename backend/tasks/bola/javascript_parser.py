@@ -108,7 +108,12 @@ class JavaScriptParser:
         self.js_code = js_code
         self.asset_name = asset_name
 
-    def extract_candidates(self, scan_id: str = "", target_domain: str = "") -> List[CandidateEndpoint]:
+    def extract_candidates(
+        self,
+        scan_id: str = "",
+        target_domain: str = "",
+        allowed_subdomains: Optional[Any] = None,
+    ) -> List[CandidateEndpoint]:
         candidates: List[CandidateEndpoint] = []
         seen_keys: Set[Tuple[str, str]] = set()
 
@@ -124,7 +129,8 @@ class JavaScriptParser:
             method = (match.group(4) or "GET").upper()
             self._process_match(
                 raw_url, method, "fetch_call", match.group(0)[:80],
-                candidates, seen_keys, scan_id, target_domain, confidence=0.75
+                candidates, seen_keys, scan_id, target_domain, confidence=0.75,
+                allowed_subdomains=allowed_subdomains,
             )
 
         # 2. Inspect axios.<method>() calls
@@ -136,7 +142,8 @@ class JavaScriptParser:
                 raw_url = f"{raw_url.rstrip('/')}/{{{concat_var}}}"
             self._process_match(
                 raw_url, method, "axios_method_call", match.group(0)[:80],
-                candidates, seen_keys, scan_id, target_domain, confidence=0.75
+                candidates, seen_keys, scan_id, target_domain, confidence=0.75,
+                allowed_subdomains=allowed_subdomains,
             )
 
         # 3. Inspect axios({url: ..., method: ...})
@@ -145,7 +152,8 @@ class JavaScriptParser:
             method = (match.group(3) or "GET").upper()
             self._process_match(
                 raw_url, method, "axios_config_call", match.group(0)[:80],
-                candidates, seen_keys, scan_id, target_domain, confidence=0.75
+                candidates, seen_keys, scan_id, target_domain, confidence=0.75,
+                allowed_subdomains=allowed_subdomains,
             )
 
         # 4. Inspect XMLHttpRequest.open()
@@ -157,7 +165,8 @@ class JavaScriptParser:
                 raw_url = f"{raw_url.rstrip('/')}/{{{concat_var}}}"
             self._process_match(
                 raw_url, method, "xhr_open_call", match.group(0)[:80],
-                candidates, seen_keys, scan_id, target_domain, confidence=0.70
+                candidates, seen_keys, scan_id, target_domain, confidence=0.70,
+                allowed_subdomains=allowed_subdomains,
             )
 
         # 5. Inspect jQuery AJAX calls
@@ -166,7 +175,8 @@ class JavaScriptParser:
             method = "POST" if ".post" in match.group(0) else "GET"
             self._process_match(
                 raw_url, method, "jquery_ajax_call", match.group(0)[:80],
-                candidates, seen_keys, scan_id, target_domain, confidence=0.70
+                candidates, seen_keys, scan_id, target_domain, confidence=0.70,
+                allowed_subdomains=allowed_subdomains,
             )
 
         # 6. Static API string pattern scanner (fallback heuristic)
@@ -180,7 +190,8 @@ class JavaScriptParser:
             # Default to GET for raw string literals unless already discovered
             self._process_match(
                 raw_url, "GET", "api_string_literal", match.group(0)[:80],
-                candidates, seen_keys, scan_id, target_domain, confidence=0.50
+                candidates, seen_keys, scan_id, target_domain, confidence=0.50,
+                allowed_subdomains=allowed_subdomains,
             )
 
         return candidates
@@ -196,13 +207,16 @@ class JavaScriptParser:
         scan_id: str,
         target_domain: str,
         confidence: float,
+        allowed_subdomains: Optional[Any] = None,
     ) -> None:
         cleaned_url = _clean_route_string(raw_url)
         if not _is_valid_api_candidate(cleaned_url):
             return
 
         if target_domain:
-            in_scope, resolved = is_url_in_scope(cleaned_url, target_domain)
+            in_scope, resolved = is_url_in_scope(
+                cleaned_url, target_domain, allowed_subdomains=allowed_subdomains
+            )
             if not in_scope or not resolved:
                 return
             parsed = urllib.parse.urlsplit(resolved)

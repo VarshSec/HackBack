@@ -18,15 +18,11 @@ _SENSITIVE_KEY_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Pattern for redacting values in key-value text snippets (e.g. password: xyz, "token": "abc")
-_KV_SNIPPET_RE = re.compile(
-    r"""(?i)(['"]?(?:password|passwd|pwd|secret|token|access_token|refresh_token|api[_-]?key|apikey|auth|authorization|bearer|cookie|session|session[_-]?id|ssn|credit[_-]?card|cvv|csrf|xsrf)['"]?\s*[:=]\s*['"]?)([^"',;\s\r\n&]+)(['"]?)"""
-)
+# Pattern for redacting userinfo in URLs embedded in snippets (e.g. https://admin:pass@host)
+_URL_USERINFO_RE = re.compile(r"""(https?://)[^/\s@]+@""")
 
-# Pattern for redacting sensitive query parameter values in snippets (e.g. ?token=abc&pwd=123)
-_QUERY_SNIPPET_RE = re.compile(
-    r"""(?i)([?&](?:password|passwd|pwd|secret|token|access_token|refresh_token|api[_-]?key|apikey|auth|authorization|bearer|cookie|session|session[_-]?id|ssn|credit[_-]?card|cvv|csrf|xsrf)=)([^&'"\s;]+)"""
-)
+# Pattern for detecting and redacting standalone JWT-like values (header.payload.signature)
+_JWT_RE = re.compile(r"""\beyJ[a-zA-Z0-9_\-]{8,}\.eyJ[a-zA-Z0-9_\-]{8,}\.[a-zA-Z0-9_\-]{8,}\b""")
 
 # Pattern for redacting Bearer tokens in headers or text
 _BEARER_RE = re.compile(r"""(?i)\b(bearer\s+)[a-zA-Z0-9_\-\.~+/]+=*""")
@@ -34,8 +30,25 @@ _BEARER_RE = re.compile(r"""(?i)\b(bearer\s+)[a-zA-Z0-9_\-\.~+/]+=*""")
 # Pattern for redacting Authorization header values
 _AUTH_HEADER_RE = re.compile(r"""(?i)(authorization\s*:\s*)[^\r\n,;]+""")
 
-# Pattern for redacting Cookie header values
-_COOKIE_HEADER_RE = re.compile(r"""(?i)(cookie\s*:\s*)[^\r\n;]+""")
+# Pattern for redacting sensitive cookie values in Cookie header or key-values
+_COOKIE_VAL_RE = re.compile(
+    r"""(?i)\b((?:session|session_id|sessionid|token|access_token|auth|jwt|csrf|xsrf|apikey|api_key|secret)=)[^;\s\r\n&#]+"""
+)
+
+# Pattern for redacting sensitive query and fragment parameter values in snippets (e.g. ?token=abc, #access_token=xyz)
+_QUERY_FRAG_SNIPPET_RE = re.compile(
+    r"""(?i)([?&#][a-zA-Z0-9_\-]*(?:password|passwd|pwd|secret|token|access_token|refresh_token|api[_-]?key|apikey|auth|authorization|bearer|cookie|session|session[_-]?id|ssn|credit[_-]?card|cvv|csrf|xsrf)[a-zA-Z0-9_\-]*=)[^&#\s'";,\)]+"""
+)
+
+# Pattern for redacting JSON quoted key-value pairs (handles values with spaces and compound names)
+_JSON_KV_RE = re.compile(
+    r"""(?i)(['"][a-zA-Z0-9_\-]*(?:password|passwd|pwd|secret|token|access_token|refresh_token|api[_-]?key|apikey|auth|authorization|bearer|cookie|session|session[_-]?id|ssn|credit[_-]?card|cvv|csrf|xsrf)[a-zA-Z0-9_\-]*['"]\s*:\s*['"])[^'"]*(['"])"""
+)
+
+# Pattern for redacting standard key-value pairs (unquoted or colon/equals)
+_KV_SNIPPET_RE = re.compile(
+    r"""(?i)\b([a-zA-Z0-9_\-]*(?:password|passwd|pwd|secret|token|access_token|refresh_token|api[_-]?key|apikey|auth|authorization|bearer|cookie|session|session[_-]?id|ssn|credit[_-]?card|cvv|csrf|xsrf)[a-zA-Z0-9_\-]*\s*[:=]\s*['"]?)[^"',;\s\r\n&#]+(['"]?)"""
+)
 
 
 def is_sensitive_key(key: str) -> bool:
@@ -46,12 +59,43 @@ def is_sensitive_key(key: str) -> bool:
     return bool(_SENSITIVE_KEY_RE.search(key) or _SENSITIVE_KEY_RE.search(unquoted))
 
 
+def _sanitize_param_string(param_str: str) -> str:
+    """
+    Redacts sensitive parameter values from a key=value[&key2=value2] string.
+    Preserves harmless parameters, harmless anchors, and non-sensitive values.
+    Handles URL-encoded sensitive parameter names (e.g. %61ccess_token).
+    """
+    if not param_str:
+        return ""
+    if "=" not in param_str:
+        return param_str
+
+    prefix = ""
+    target_str = param_str
+    if "?" in param_str:
+        prefix, target_str = param_str.split("?", 1)
+        prefix += "?"
+
+    pairs = urllib.parse.parse_qsl(target_str, keep_blank_values=True)
+    if not pairs:
+        return param_str
+
+    sanitized_parts: List[str] = []
+    for k, v in pairs:
+        if is_sensitive_key(k):
+            sanitized_parts.append(f"{k}=[REDACTED]")
+        else:
+            sanitized_parts.append(f"{k}={v}")
+    return prefix + "&".join(sanitized_parts)
+
+
 def sanitize_url(raw_url: str) -> str:
     """
-    Sanitizes a URL by stripping user-info credentials and redacting sensitive query parameter values.
+    Sanitizes a URL by stripping user-info credentials and redacting sensitive
+    query and fragment parameter values.
     Example:
-      'https://admin:pass123@api.test/v1/items?token=secret99&id=10'
-      -> 'https://api.test/v1/items?token=[REDACTED]&id=10'
+      'https://admin:pass123@api.test/v1/items?token=secret99#access_token=secret100'
+      -> 'https://api.test/v1/items?token=[REDACTED]#access_token=[REDACTED]'
     """
     if not raw_url or not isinstance(raw_url, str):
         return ""
@@ -67,40 +111,48 @@ def sanitize_url(raw_url: str) -> str:
         netloc = netloc.split("@", 1)[1]
 
     # 2. Redact sensitive query parameter values
-    query = parsed.query
-    if query:
-        pairs = urllib.parse.parse_qsl(query, keep_blank_values=True)
-        sanitized_pairs: List[Tuple[str, str]] = []
-        for k, v in pairs:
-            if is_sensitive_key(k):
-                sanitized_pairs.append((k, "[REDACTED]"))
-            else:
-                sanitized_pairs.append((k, v))
-        query = urllib.parse.urlencode(sanitized_pairs)
+    query = _sanitize_param_string(parsed.query)
 
-    return urllib.parse.urlunsplit((parsed.scheme, netloc, parsed.path, query, parsed.fragment))
+    # 3. Redact sensitive fragment parameter values
+    fragment = _sanitize_param_string(parsed.fragment)
+
+    return urllib.parse.urlunsplit((parsed.scheme, netloc, parsed.path, query, fragment))
 
 
 def sanitize_snippet(snippet: Optional[str], max_len: int = 500) -> Optional[str]:
     """
     Redacts credential and secret values from evidence snippets while preserving
     non-sensitive diagnostic context and parameter names.
+    Protects against:
+    - URL user-info credentials embedded in snippets.
+    - Sensitive query and fragment values in embedded URLs.
+    - Bearer tokens.
+    - Standalone JWT-like values.
+    - Authorization headers.
+    - Sensitive cookie values.
+    - JSON and key-value secret patterns.
     """
     if snippet is None:
         return None
 
     s = snippet
 
-    # 1. Redact Authorization headers
+    # 1. Strip embedded URL user-info (e.g. https://user:pass@host)
+    s = _URL_USERINFO_RE.sub(r"\1", s)
+    # 2. Redact standalone JWT tokens
+    s = _JWT_RE.sub("[REDACTED]", s)
+    # 3. Redact Authorization headers
     s = _AUTH_HEADER_RE.sub(r"\1[REDACTED]", s)
-    # 2. Redact Cookie headers
-    s = _COOKIE_HEADER_RE.sub(r"\1[REDACTED]", s)
-    # 3. Redact Bearer tokens
+    # 4. Redact Bearer tokens
     s = _BEARER_RE.sub(r"\1[REDACTED]", s)
-    # 4. Redact key-value pairs (password: xyz -> password: [REDACTED])
-    s = _KV_SNIPPET_RE.sub(r"\1[REDACTED]\3", s)
-    # 5. Redact query parameters in snippet text
-    s = _QUERY_SNIPPET_RE.sub(r"\1[REDACTED]", s)
+    # 5. Redact query and fragment parameters in snippet text
+    s = _QUERY_FRAG_SNIPPET_RE.sub(r"\1[REDACTED]", s)
+    # 6. Redact sensitive cookie values in Cookie headers or text
+    s = _COOKIE_VAL_RE.sub(r"\1[REDACTED]", s)
+    # 7. Redact JSON quoted key-value pairs (with spaces/quotes)
+    s = _JSON_KV_RE.sub(r"\1[REDACTED]\2", s)
+    # 8. Redact standard key-value pairs
+    s = _KV_SNIPPET_RE.sub(r"\1[REDACTED]\2", s)
 
     return s[:max_len]
 

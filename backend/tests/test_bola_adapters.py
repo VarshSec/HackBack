@@ -236,41 +236,67 @@ paths:
 
 class TestURLScopeEnforcement:
     def test_scope_allowed_targets(self):
+        # 1. Exact target host is allowed
         in_scope, res = is_url_in_scope("https://target.test/api/v1", "target.test")
         assert in_scope is True
         assert res == "https://target.test/api/v1"
 
-        in_scope, res = is_url_in_scope("https://api.target.test/v1/users", "target.test")
+        # 2. Explicitly approved subdomain is allowed when listed in configuration
+        in_scope, res = is_url_in_scope(
+            "https://api.target.test/v1/users", "target.test", allowed_subdomains=["api.target.test"]
+        )
         assert in_scope is True
         assert res == "https://api.target.test/v1/users"
 
-        # Relative path with base_url
+        # 3. Trailing-dot and case normalization
+        in_scope, res = is_url_in_scope("https://TARGET.TEST.:8080/api/v1", "target.test.")
+        assert in_scope is True
+        assert "target.test" in (res or "").lower()
+
+        in_scope, res = is_url_in_scope(
+            "https://API.TARGET.TEST./v1", "TARGET.TEST", allowed_subdomains=["api.target.test."]
+        )
+        assert in_scope is True
+
+        # 4. Relative path with valid base_url
         in_scope, res = is_url_in_scope("/api/v1/orders", "target.test", base_url="https://target.test")
         assert in_scope is True
         assert res == "https://target.test/api/v1/orders"
 
-        # Relative path without base_url
+        # 5. Relative path without base_url
         in_scope, res = is_url_in_scope("/api/v1/orders", "target.test")
         assert in_scope is True
         assert res == "/api/v1/orders"
 
     def test_scope_rejected_targets(self):
-        # Lookalike domains
+        # 1. Unapproved subdomains are strictly rejected (never inferred merely from hostname suffix)
+        assert is_url_in_scope("https://api.target.test/v1/users", "target.test")[0] is False
+        assert is_url_in_scope(
+            "https://unapproved.target.test/v1", "target.test", allowed_subdomains=["api.target.test"]
+        )[0] is False
+
+        # 2. Lookalike domains
         assert is_url_in_scope("https://target.test.attacker.test/api", "target.test")[0] is False
+        assert is_url_in_scope(
+            "https://target.test.attacker.test/api", "target.test", allowed_subdomains=["api.target.test"]
+        )[0] is False
         assert is_url_in_scope("https://nottarget.test/api", "target.test")[0] is False
         assert is_url_in_scope("https://target.test.co/api", "target.test")[0] is False
 
-        # Userinfo credentials in URL
+        # 3. Userinfo credentials in URL
         assert is_url_in_scope("https://user:pass@target.test/api", "target.test")[0] is False
         assert is_url_in_scope("https://admin@target.test/api", "target.test")[0] is False
 
-        # Unsupported / dangerous schemes
+        # 4. Relative URL with base URL pointing outside authorized scope
+        assert is_url_in_scope("/api/v1/orders", "target.test", base_url="https://attacker.test")[0] is False
+
+        # 5. Unsupported / dangerous schemes
         assert is_url_in_scope("javascript:alert(1)", "target.test")[0] is False
         assert is_url_in_scope("file:///etc/passwd", "target.test")[0] is False
         assert is_url_in_scope("data:text/html,<html>", "target.test")[0] is False
         assert is_url_in_scope("mailto:admin@target.test", "target.test")[0] is False
 
-        # Empty / non-string / malformed
+        # 6. Empty / non-string / malformed
         assert is_url_in_scope("", "target.test")[0] is False
         assert is_url_in_scope(None, "target.test")[0] is False
         assert is_url_in_scope("   ", "target.test")[0] is False

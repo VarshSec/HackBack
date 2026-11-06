@@ -41,6 +41,12 @@ class TestSecretLeakageWithCanaries:
     CANARY_COOKIE = "CANARY_COOKIE_SESSION_112233_SECRET"
     CANARY_USERINFO_PASS = "CANARY_USERINFO_SECRET_4455"
     CANARY_API_KEY = "CANARY_API_KEY_XYZ_9999_SECRET"
+    CANARY_FRAG_TOKEN = "CANARY_FRAG_SECRET_776655"
+    CANARY_JWT = (
+        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+        "eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIn0."
+        "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+    )
 
     def test_url_with_userinfo_and_sensitive_query(self):
         url = (
@@ -118,6 +124,122 @@ class TestSecretLeakageWithCanaries:
         assert self.CANARY_AUTH_TOKEN not in dumped
         assert self.CANARY_COOKIE not in dumped
         assert self.CANARY_PASSWORD not in dumped
+
+    def test_url_fragment_secret_redaction(self):
+        canary = self.CANARY_FRAG_TOKEN
+
+        # 1. #access_token=CANARY
+        url1 = f"https://target.test/oauth/callback#access_token={canary}"
+        san1 = sanitize_url(url1)
+        assert canary not in san1
+        assert "access_token=[REDACTED]" in san1
+
+        # 2. #token=CANARY
+        url2 = f"https://target.test/auth#token={canary}"
+        san2 = sanitize_url(url2)
+        assert canary not in san2
+        assert "token=[REDACTED]" in san2
+
+        # 3. #state=normal&access_token=CANARY
+        url3 = f"https://target.test/auth#state=normal&access_token={canary}"
+        san3 = sanitize_url(url3)
+        assert canary not in san3
+        assert "state=normal" in san3
+        assert "access_token=[REDACTED]" in san3
+
+        # 4. URL-encoded sensitive parameter names (%61ccess_token)
+        url4 = f"https://target.test/auth#%61ccess_token={canary}"
+        san4 = sanitize_url(url4)
+        assert canary not in san4
+        assert "[REDACTED]" in san4
+
+        # 5. Preserve harmless fragment parameters and anchors
+        url5 = "https://target.test/dashboard#state=normal&tab=overview"
+        san5 = sanitize_url(url5)
+        assert san5 == url5
+
+        url6 = "https://target.test/docs#section-auth-guide"
+        san6 = sanitize_url(url6)
+        assert san6 == url6
+
+        # 6. Serialized CandidateEndpoint never leaks fragment canaries
+        endpoint = CandidateEndpoint(
+            candidate_id="cand-frag-01",
+            scan_id="scan-frag",
+            target_domain="target.test",
+            method="GET",
+            original_url=f"https://target.test/callback?user=bob#state=ok&access_token={canary}",
+            route_template="/callback",
+            resource_type="callback",
+        )
+        assert canary not in endpoint.original_url
+        assert "access_token=[REDACTED]" in endpoint.original_url
+        assert "state=ok" in endpoint.original_url
+
+        dumped = json.dumps(endpoint.to_dict())
+        assert canary not in dumped
+
+    def test_hardened_evidence_snippet_canaries(self):
+        canary_userinfo = "CANARY_SNIP_USERINFO_PASS_1122"
+        canary_query = "CANARY_SNIP_QUERY_TOKEN_3344"
+        canary_frag = "CANARY_SNIP_FRAG_TOKEN_5566"
+        canary_bearer = "CANARY_SNIP_BEARER_7788"
+        canary_jwt = self.CANARY_JWT
+        canary_cookie = "CANARY_SNIP_COOKIE_9900"
+        canary_spaces = "CANARY PASS WITH MULTIPLE SPACES 123"
+
+        raw_snippet = (
+            f"Observed request: GET https://admin:{canary_userinfo}@target.test/api/v1/users"
+            f"?token={canary_query}&role=admin#access_token={canary_frag} HTTP/1.1\r\n"
+            f"Authorization: Bearer {canary_bearer}\r\n"
+            f"Cookie: session={canary_cookie}; theme=dark; tracking_id=track_456\r\n"
+            f"X-User-Token: {canary_jwt}\r\n"
+            f'Body: {{"password": "{canary_spaces}", "client_secret": "CANARY_SNIP_KEY", "items_count": 5}}'
+        )
+
+        ev = EvidenceRecord(
+            source="traffic",
+            parser="TrafficObserver",
+            location="https://target.test/api/v1/users",
+            snippet=raw_snippet,
+            confidence_signals=["live_traffic"],
+        )
+
+        endpoint = CandidateEndpoint(
+            candidate_id="cand-snip-hardened",
+            scan_id="scan-snip",
+            target_domain="target.test",
+            method="GET",
+            original_url="https://target.test/api/v1/users",
+            route_template="/api/v1/users",
+            resource_type="users",
+            evidence=[ev],
+        )
+
+        # 1. Assert NONE of the canary values appear in ev.snippet
+        assert canary_userinfo not in ev.snippet
+        assert canary_query not in ev.snippet
+        assert canary_frag not in ev.snippet
+        assert canary_bearer not in ev.snippet
+        assert canary_jwt not in ev.snippet
+        assert canary_cookie not in ev.snippet
+        assert canary_spaces not in ev.snippet
+        assert "CANARY_SNIP_KEY" not in ev.snippet
+
+        # 2. Assert harmless diagnostic context and non-sensitive values are preserved
+        assert "role=admin" in ev.snippet
+        assert "theme=dark" in ev.snippet
+        assert "tracking_id=track_456" in ev.snippet
+        assert "items_count" in ev.snippet
+        assert "/api/v1/users" in ev.snippet
+
+        # 3. Assert serialized data does not contain any canary
+        dumped = json.dumps(endpoint.to_dict())
+        for c in (
+            canary_userinfo, canary_query, canary_frag, canary_bearer,
+            canary_jwt, canary_cookie, canary_spaces, "CANARY_SNIP_KEY"
+        ):
+            assert c not in dumped
 
     def test_candidate_parameter_sample_value_and_nested_json(self):
         param = CandidateParameter(

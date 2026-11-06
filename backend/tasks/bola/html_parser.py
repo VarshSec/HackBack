@@ -78,16 +78,25 @@ class HTMLPageParser:
     Parses HTML content to extract CandidateEndpoints from forms and links.
     """
 
-    def __init__(self, html_text: str, page_url: str, target_domain: str):
+    def __init__(
+        self,
+        html_text: str,
+        page_url: str,
+        target_domain: str,
+        allowed_subdomains: Optional[Any] = None,
+    ):
         self.html_text = html_text
         self.page_url = page_url
         self.target_domain = target_domain.strip().lower()
+        self.allowed_subdomains = list(allowed_subdomains) if allowed_subdomains else []
 
     def _is_in_scope(self, url: str) -> Tuple[bool, str]:
         """
         Ensures the URL belongs to the target domain scope and returns the normalized path.
         """
-        in_scope, resolved = is_url_in_scope(url, self.target_domain, base_url=self.page_url)
+        in_scope, resolved = is_url_in_scope(
+            url, self.target_domain, base_url=self.page_url, allowed_subdomains=self.allowed_subdomains
+        )
         return in_scope, (resolved or "")
 
     def extract_candidates(self, scan_id: str = "") -> List[CandidateEndpoint]:
